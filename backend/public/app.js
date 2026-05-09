@@ -76,8 +76,8 @@ function appendDivider() {
 }
 
 function getBackendUrl() {
-  // Lấy giá trị từ ô input và xóa dấu gạch chéo ở cuối (nếu có)
   const url = els.backendUrl.value.trim();
+  if (!url) return ''; // Tránh lỗi nếu ô nhập liệu trống
   return url.replace(/\/$/, "");
 }
 
