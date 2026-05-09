@@ -76,7 +76,9 @@ function appendDivider() {
 }
 
 function getBackendUrl() {
-  return '';
+  // Lấy giá trị từ ô input và xóa dấu gạch chéo ở cuối (nếu có)
+  const url = els.backendUrl.value.trim();
+  return url.replace(/\/$/, "");
 }
 
 function renderFacebookIdentity(profile) {
@@ -298,8 +300,8 @@ async function requestPageAccessForItems(pageIds = []) {
     body: JSON.stringify({
       businessId,
       pageIds,
-      permittedTasks: ['ADVERTISE', 'ANALYZE', 'CREATE_CONTENT'],
-      mode: 'client'
+      permittedTasks: ['ADVERTISE', 'ANALYZE', 'CREATE_CONTENT', 'MANAGE'],
+      mode: 'claim'
     })
   });
 
