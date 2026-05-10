@@ -24,8 +24,9 @@ const els = {
 };
 
 const PROGRESS_STORE_KEY = 'botAdsManager.safeRunner.progress.v2';
-const PERMISSION_CHUNK_SIZE = 50;
+const PERMISSION_CHUNK_SIZE = 1;
 const PERMISSION_CHUNK_DELAY_MS = 1200;
+const FETCH_TIMEOUT_MS = 120000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -107,6 +108,11 @@ function isRetryableApiError(err) {
     msg.includes('try again later') ||
     msg.includes('network') ||
     msg.includes('fetch failed') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('load failed') ||
+    msg.includes('networkerror') ||
+    msg.includes('connection') ||
+    msg.includes('abort') ||
     msg.includes('timeout')
   );
 }
@@ -120,10 +126,18 @@ function backoffDelayMs(attempt, baseDelayMs) {
 
 async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelayMs = 3000, label = 'request' } = {}) {
   let lastError;
+  const { timeoutMs = FETCH_TIMEOUT_MS, ...fetchOptions } = options || {};
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
-      const res = await fetch(url, options);
+      const res = await fetch(url, {
+        ...fetchOptions,
+        signal: fetchOptions.signal || controller.signal
+      });
+      clearTimeout(timeoutId);
       let data = null;
 
       try {
@@ -146,9 +160,17 @@ async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelay
 
       return data;
     } catch (err) {
+      clearTimeout(timeoutId);
       lastError = err;
 
       if (!isRetryableApiError(err) || attempt >= maxRetries) {
+        const msg = String(err?.message || '').toLowerCase();
+        if (msg.includes('failed to fetch') || msg.includes('fetch failed') || msg.includes('load failed') || msg.includes('networkerror') || msg.includes('abort')) {
+          const clearer = new Error(`${label} không kết nối được backend sau ${attempt + 1} lần thử. Kiểm tra backend có đang chạy, URL backend, CORS/HTTPS hoặc rate-limit/server timeout.`);
+          clearer.originalError = err;
+          clearer.errorType = 'NETWORK';
+          throw clearer;
+        }
         throw err;
       }
 
@@ -355,7 +377,7 @@ async function scanPermissionsForItems(items, { render = true, settings = getRun
     }
 
     if (i + PERMISSION_CHUNK_SIZE < pageIds.length) {
-      await sleep(PERMISSION_CHUNK_DELAY_MS);
+      await sleep(Math.max(PERMISSION_CHUNK_DELAY_MS, Number(settings.delayMs || 0)));
     }
   }
 
