@@ -357,8 +357,10 @@ app.post('/flow/run-full-draft', async (req, res) => {
     });
   } catch (err) {
     res.status(400).json({
+      ok: false,
       error: err.message,
-      errorType: err.errorType || classifyMetaError(err.message)
+      errorType: err.errorType || classifyMetaError(err.message),
+      meta: err.meta || null
     });
   }
 });

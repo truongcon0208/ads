@@ -7,6 +7,9 @@ const els = {
   postId: $('postId'),
   defaultPageName: $('defaultPageName'),
   defaultBudget: $('defaultBudget'),
+  batchDelayMs: $('batchDelayMs'),
+  maxRetries: $('maxRetries'),
+  resumeSuccessful: $('resumeSuccessful'),
   batchInput: $('batchInput'),
   permissionCheckBtn: $('permissionCheckBtn'),
   runFullFlowBtn: $('runFullFlowBtn'),
@@ -15,10 +18,18 @@ const els = {
   authStatus: $('authStatus'),
   fbIdentity: $('fbIdentity'),
   loginFacebookBtn: $('loginFacebookBtn'),
-  businessId: document.getElementById('businessId'),
-requestAccessBtn: document.getElementById('requestAccessBtn'),
-permissionInput: document.getElementById('permissionInput'),
+  businessId: $('businessId'),
+  requestAccessBtn: $('requestAccessBtn'),
+  permissionInput: $('permissionInput')
 };
+
+const PROGRESS_STORE_KEY = 'botAdsManager.safeRunner.progress.v2';
+const PERMISSION_CHUNK_SIZE = 50;
+const PERMISSION_CHUNK_DELAY_MS = 1200;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function escapeHtml(str) {
   return String(str)
@@ -33,10 +44,6 @@ function setStatusHtml(html) {
   els.status.innerHTML = html;
 }
 
-function setStatus(message) {
-  setStatusHtml(`<div class="log-line">${escapeHtml(message)}</div>`);
-}
-
 function appendStatus(message, type = 'normal') {
   const cls = `log-line log-${type}`;
   const icon =
@@ -47,17 +54,7 @@ function appendStatus(message, type = 'normal') {
     '•';
 
   els.status.innerHTML += `<div class="${cls}">${icon} ${escapeHtml(message)}</div>`;
-}
-
-function appendStatusLink(label, url) {
-  const safeLabel = escapeHtml(label);
-  const safeUrl = escapeHtml(url);
-
-  els.status.innerHTML += `
-    <div class="log-line log-link">
-      🔗 ${safeLabel}: <a href="${safeUrl}" target="_blank" rel="noopener noreferrer">Mở Ads Manager</a>
-    </div>
-  `;
+  els.status.scrollTop = els.status.scrollHeight;
 }
 
 function appendNameLink(name, url) {
@@ -69,6 +66,7 @@ function appendNameLink(name, url) {
       ✅ ${safeName} - <a href="${safeUrl}" target="_blank" rel="noopener noreferrer">Mở link</a>
     </div>
   `;
+  els.status.scrollTop = els.status.scrollHeight;
 }
 
 function appendDivider() {
@@ -77,8 +75,90 @@ function appendDivider() {
 
 function getBackendUrl() {
   const url = els.backendUrl.value.trim();
-  if (!url) return ''; // Tránh lỗi nếu ô nhập liệu trống
-  return url.replace(/\/$/, "");
+  if (!url) return '';
+  return url.replace(/\/$/, '');
+}
+
+function getPositiveIntFromInput(input, fallback, min, max) {
+  const value = Number(input?.value ?? fallback);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(Math.max(Math.floor(value), min), max);
+}
+
+function getRunSettings() {
+  return {
+    delayMs: getPositiveIntFromInput(els.batchDelayMs, 3000, 0, 300000),
+    maxRetries: getPositiveIntFromInput(els.maxRetries, 4, 0, 10),
+    resumeSuccessful: els.resumeSuccessful ? els.resumeSuccessful.checked : true
+  };
+}
+
+function isRetryableApiError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  const type = String(err?.errorType || '').toUpperCase();
+  const code = Number(err?.meta?.code);
+
+  return (
+    type === 'RATE_LIMIT' ||
+    [4, 17, 32, 613, 80004].includes(code) ||
+    msg.includes('rate limit') ||
+    msg.includes('too many calls') ||
+    msg.includes('temporarily blocked') ||
+    msg.includes('try again later') ||
+    msg.includes('network') ||
+    msg.includes('fetch failed') ||
+    msg.includes('timeout')
+  );
+}
+
+function backoffDelayMs(attempt, baseDelayMs) {
+  const base = Math.max(1000, Number(baseDelayMs || 3000));
+  const delay = Math.min(90000, base * Math.pow(2, attempt));
+  const jitter = Math.floor(Math.random() * 1000);
+  return delay + jitter;
+}
+
+async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelayMs = 3000, label = 'request' } = {}) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      let data = null;
+
+      try {
+        data = await res.json();
+      } catch {
+        const err = new Error(`${label} không trả JSON. HTTP ${res.status}`);
+        err.status = res.status;
+        err.errorType = res.status === 429 || res.status >= 500 ? 'RATE_LIMIT' : 'UNKNOWN';
+        throw err;
+      }
+
+      if (!res.ok || data?.ok === false) {
+        const err = new Error(data?.error || `HTTP ${res.status}`);
+        err.status = res.status;
+        err.errorType = data?.errorType || (res.status === 429 || res.status >= 500 ? 'RATE_LIMIT' : 'UNKNOWN');
+        err.meta = data?.meta || data?.error?.meta || null;
+        err.data = data;
+        throw err;
+      }
+
+      return data;
+    } catch (err) {
+      lastError = err;
+
+      if (!isRetryableApiError(err) || attempt >= maxRetries) {
+        throw err;
+      }
+
+      const waitMs = backoffDelayMs(attempt, baseDelayMs);
+      appendStatus(`${label} bị limit/lỗi mạng, retry lần ${attempt + 1}/${maxRetries} sau ${Math.round(waitMs / 1000)}s`, 'running');
+      await sleep(waitMs);
+    }
+  }
+
+  throw lastError || new Error(`${label} thất bại`);
 }
 
 function renderFacebookIdentity(profile) {
@@ -116,7 +196,7 @@ async function checkFacebookAuth() {
       els.loginFacebookBtn.textContent = 'Đăng nhập Facebook';
       renderFacebookIdentity(null);
     }
-  } catch (err) {
+  } catch (_err) {
     els.authStatus.textContent = 'Không kết nối được backend';
     els.authStatus.className = 'auth-status warn';
     renderFacebookIdentity(null);
@@ -145,7 +225,6 @@ function parseBatchInput(raw) {
     }
 
     const pageName = defaultPageName || pageId;
-
     items.push({ pageId, pageName, budget });
   }
 
@@ -178,9 +257,53 @@ function buildPayloadFromFirstItem(item) {
   };
 }
 
+function loadProgressStore() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PROGRESS_STORE_KEY) || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveProgressStore(store) {
+  localStorage.setItem(PROGRESS_STORE_KEY, JSON.stringify(store));
+}
+
+function makeProgressKey(payload) {
+  const raw = JSON.stringify({
+    backendUrl: getBackendUrl(),
+    adAccountId: payload.adAccountId,
+    pageId: payload.pageId,
+    dailyBudget: payload.dailyBudget,
+    objective: payload.objective,
+    postId: payload.postId || ''
+  });
+
+  try {
+    return btoa(unescape(encodeURIComponent(raw)));
+  } catch {
+    return raw;
+  }
+}
+
+function markProgress(payload, record) {
+  const store = loadProgressStore();
+  store[makeProgressKey(payload)] = {
+    ...record,
+    updatedAt: new Date().toISOString()
+  };
+  saveProgressStore(store);
+}
+
+function getProgress(payload) {
+  const store = loadProgressStore();
+  return store[makeProgressKey(payload)] || null;
+}
+
 let running = false;
 
-async function scanPermissionsForItems(items, { render = true } = {}) {
+async function scanPermissionsForItems(items, { render = true, settings = getRunSettings() } = {}) {
   const adAccountId = els.adAccountId.value.trim();
   const pageIds = [
     ...new Set(
@@ -198,44 +321,73 @@ async function scanPermissionsForItems(items, { render = true } = {}) {
     throw new Error('Không có pageId để check quyền.');
   }
 
-  const res = await fetch(`${getBackendUrl()}/permissions/scan`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ adAccountId, pageIds })
-  });
+  const merged = {
+    ok: true,
+    adAccount: null,
+    pages: [],
+    summary: { totalPages: 0, allowedPages: 0, blockedPages: 0 }
+  };
 
-  let data;
-  try {
-    data = await res.json();
-  } catch {
-    throw new Error(`API /permissions/scan không trả JSON. HTTP ${res.status}`);
+  for (let i = 0; i < pageIds.length; i += PERMISSION_CHUNK_SIZE) {
+    const chunk = pageIds.slice(i, i + PERMISSION_CHUNK_SIZE);
+    const from = i + 1;
+    const to = i + chunk.length;
+
+    if (render) {
+      appendStatus(`Check quyền ${from}-${to}/${pageIds.length}`, 'running');
+    }
+
+    const data = await fetchJsonWithRetry(`${getBackendUrl()}/permissions/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adAccountId, pageIds: chunk })
+    }, {
+      maxRetries: settings.maxRetries,
+      baseDelayMs: settings.delayMs,
+      label: `Check quyền ${from}-${to}`
+    });
+
+    if (!merged.adAccount) merged.adAccount = data.adAccount || null;
+    merged.pages.push(...(data.pages || []));
+
+    if (data.adAccount && !data.adAccount.ok) {
+      merged.ok = false;
+    }
+
+    if (i + PERMISSION_CHUNK_SIZE < pageIds.length) {
+      await sleep(PERMISSION_CHUNK_DELAY_MS);
+    }
   }
 
-  if (!res.ok) {
-    throw new Error(data?.error || `HTTP ${res.status}`);
-  }
-
-  const blockedPages = (data.pages || []).filter((x) => !x.ok);
-  const allowedPages = (data.pages || []).filter((x) => x.ok);
+  const blockedPages = merged.pages.filter((x) => !x.ok);
+  const allowedPages = merged.pages.filter((x) => x.ok);
+  merged.ok = Boolean(merged.adAccount?.ok) && blockedPages.length === 0;
+  merged.summary = {
+    totalPages: merged.pages.length,
+    allowedPages: allowedPages.length,
+    blockedPages: blockedPages.length
+  };
 
   if (render) {
-    if (!data.adAccount?.ok) {
+    if (!merged.adAccount?.ok) {
       appendStatus('ACT không có quyền', 'error');
-      return data;
+      return merged;
     }
 
     if (!blockedPages.length) {
       appendStatus(`Tất cả ${allowedPages.length} ID đều có quyền`, 'success');
     } else {
-      appendStatus(`${blockedPages.length}/${data.pages.length} ID không có quyền`, 'error');
-
-      for (const page of blockedPages) {
+      appendStatus(`${blockedPages.length}/${merged.pages.length} ID không có quyền`, 'error');
+      for (const page of blockedPages.slice(0, 80)) {
         appendStatus(`${page.pageId} không có quyền`, 'error');
+      }
+      if (blockedPages.length > 80) {
+        appendStatus(`Còn ${blockedPages.length - 80} ID lỗi quyền, không hiển thị hết để tránh lag log`, 'running');
       }
     }
   }
 
-  return data;
+  return merged;
 }
 
 async function checkPermissionsOnly() {
@@ -245,25 +397,18 @@ async function checkPermissionsOnly() {
 
   try {
     const rawPermissionInput = els.permissionInput?.value || els.batchInput?.value || '';
-const pageIds = parsePageIdsOnly(rawPermissionInput);
-
-const items = pageIds.map((pageId) => ({
-  pageId,
-  pageName: pageId,
-  budget: Number(els.defaultBudget?.value || 100)
-}));
-
-const errors = [];
-
-    if (errors.length) {
-      throw new Error(`Lỗi input:\n${errors.join('\n')}`);
-    }
+    const pageIds = parsePageIdsOnly(rawPermissionInput);
+    const items = pageIds.map((pageId) => ({
+      pageId,
+      pageName: pageId,
+      budget: Number(els.defaultBudget?.value || 100)
+    }));
 
     if (!items.length) {
       throw new Error('Không có record hợp lệ.');
     }
 
-    appendStatus('Bắt đầu check quyền trước khi chạy', 'section');
+    appendStatus('Bắt đầu check quyền theo cụm nhỏ', 'section');
     await scanPermissionsForItems(items, { render: true });
     appendDivider();
     appendStatus('Check quyền xong.', 'section');
@@ -273,8 +418,10 @@ const errors = [];
     running = false;
   }
 }
+
 async function requestPageAccessForItems(pageIds = []) {
   const businessId = els.businessId?.value?.trim();
+  const settings = getRunSettings();
 
   pageIds = [
     ...new Set(
@@ -292,48 +439,61 @@ async function requestPageAccessForItems(pageIds = []) {
     throw new Error('Không có ID để thêm quyền.');
   }
 
-  appendStatus(`Đang add/claim ${pageIds.length} Page vào Business bằng API owned_pages...`, 'running');
+  const allResults = [];
+  appendStatus(`Đang add/claim ${pageIds.length} Page vào Business theo cụm nhỏ...`, 'running');
 
-  const res = await fetch(`${getBackendUrl()}/permissions/request-page-access`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      businessId,
-      pageIds,
-      permittedTasks: ['ADVERTISE', 'ANALYZE', 'CREATE_CONTENT', 'MANAGE'],
-      mode: 'claim'
-    })
-  });
+  for (let i = 0; i < pageIds.length; i += PERMISSION_CHUNK_SIZE) {
+    const chunk = pageIds.slice(i, i + PERMISSION_CHUNK_SIZE);
+    const from = i + 1;
+    const to = i + chunk.length;
 
-  let data;
-  try {
-    data = await res.json();
-  } catch {
-    throw new Error(`API request-page-access không trả JSON. HTTP ${res.status}`);
+    appendStatus(`Add/claim ${from}-${to}/${pageIds.length}`, 'running');
+
+    const data = await fetchJsonWithRetry(`${getBackendUrl()}/permissions/request-page-access`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        businessId,
+        pageIds: chunk,
+        permittedTasks: ['ADVERTISE', 'ANALYZE', 'CREATE_CONTENT', 'MANAGE'],
+        mode: 'claim'
+      })
+    }, {
+      maxRetries: settings.maxRetries,
+      baseDelayMs: settings.delayMs,
+      label: `Add/claim ${from}-${to}`
+    });
+
+    allResults.push(...(data.results || []));
+    if (i + PERMISSION_CHUNK_SIZE < pageIds.length) await sleep(PERMISSION_CHUNK_DELAY_MS);
   }
 
-  if (!res.ok) {
-    throw new Error(data?.error || `HTTP ${res.status}`);
-  }
+  const failed = allResults.filter((x) => !x.ok);
+  const success = allResults.filter((x) => x.ok);
 
-  const failed = (data.results || []).filter((x) => !x.ok);
-  const success = (data.results || []).filter((x) => x.ok);
+  appendStatus(`Đã add/claim vào Business: ${success.length}/${pageIds.length} ID`, failed.length ? 'running' : 'success');
 
-  appendStatus(`Đã add/claim vào Business: ${success.length}/${data.total || pageIds.length} ID`, failed.length ? 'running' : 'success');
-
-  for (const item of failed) {
+  for (const item of failed.slice(0, 80)) {
     appendStatus(`${item.pageId} lỗi: ${item.error || item.status}`, 'error');
   }
+  if (failed.length > 80) {
+    appendStatus(`Còn ${failed.length - 80} lỗi add/claim, không hiển thị hết để tránh lag log`, 'running');
+  }
 
-  return data;
+  return { ok: failed.length === 0, total: pageIds.length, success: success.length, failed: failed.length, results: allResults };
 }
+
 async function runFullFlow() {
   if (running) return;
   running = true;
+  els.runFullFlowBtn.disabled = true;
+  const oldButtonText = els.runFullFlowBtn.textContent;
+  els.runFullFlowBtn.textContent = 'Đang chạy an toàn...';
 
   setStatusHtml('');
 
   try {
+    const settings = getRunSettings();
     const { items, errors } = parseBatchInput(els.batchInput.value || '');
 
     if (errors.length) {
@@ -345,8 +505,9 @@ async function runFullFlow() {
     }
 
     appendStatus(`Bắt đầu chạy ${items.length} dòng`, 'section');
+    appendStatus(`Chế độ an toàn: chạy lần lượt từng ID | delay ${settings.delayMs}ms | retry ${settings.maxRetries} lần | resume ${settings.resumeSuccessful ? 'bật' : 'tắt'}`, 'section');
 
-    const permissionScan = await scanPermissionsForItems(items, { render: true });
+    const permissionScan = await scanPermissionsForItems(items, { render: true, settings });
     if (!permissionScan.adAccount?.ok) {
       throw new Error(`Ad Account chưa có quyền trong token/BM: ${els.adAccountId.value.trim()}`);
     }
@@ -360,7 +521,8 @@ async function runFullFlow() {
     const summary = {
       success: 0,
       failed: 0,
-      skippedNoPermission: 0
+      skippedNoPermission: 0,
+      skippedAlreadyDone: 0
     };
 
     for (let i = 0; i < items.length; i++) {
@@ -374,26 +536,38 @@ async function runFullFlow() {
       if (blocked) {
         summary.skippedNoPermission += 1;
         appendStatus(`${item.pageName} - SKIP: page chưa cấp quyền vào Business/token`, 'error');
+        markProgress(payload, { ok: false, status: 'skipped_no_permission', error: blocked.reason || blocked.error || 'No permission' });
+        continue;
+      }
+
+      const existingProgress = getProgress(payload);
+      if (settings.resumeSuccessful && existingProgress?.ok) {
+        summary.skippedAlreadyDone += 1;
+        appendStatus(`${item.pageName} - SKIP: đã thành công trước đó (${existingProgress.adId || existingProgress.adSetId || existingProgress.campaignId || 'done'})`, 'success');
         continue;
       }
 
       try {
-        const res = await fetch(`${getBackendUrl()}/flow/run-full-draft`, {
+        const data = await fetchJsonWithRetry(`${getBackendUrl()}/flow/run-full-draft`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
+        }, {
+          maxRetries: settings.maxRetries,
+          baseDelayMs: settings.delayMs,
+          label: `Page ${item.pageId}`
         });
 
-        const data = await res.json();
-
-        if (!res.ok || !data?.ok) {
-          summary.failed += 1;
-          const errorType = data?.errorType ? ` [${data.errorType}]` : '';
-          appendStatus(`${item.pageName} - ${data?.error || 'Lỗi backend'}${errorType}`, 'error');
-          continue;
-        }
-
         summary.success += 1;
+        markProgress(payload, {
+          ok: true,
+          status: 'success',
+          campaignId: data?.campaign?.id || null,
+          adSetId: data?.adSet?.id || null,
+          adId: data?.ad?.id || null,
+          adsManagerUrl: data?.adsManagerUrl || null
+        });
+
         if (data.adsManagerUrl) {
           appendNameLink(item.pageName, data.adsManagerUrl);
         } else {
@@ -401,22 +575,30 @@ async function runFullFlow() {
         }
       } catch (err) {
         summary.failed += 1;
-        appendStatus(`${item.pageName} - ${err.message}`, 'error');
+        const errorType = err?.errorType ? ` [${err.errorType}]` : '';
+        const backendData = err?.data || null;
+        const errorMessage = backendData?.error || err.message || 'Lỗi backend';
+        markProgress(payload, { ok: false, status: 'failed', error: errorMessage, errorType: err?.errorType || null });
+        appendStatus(`${item.pageName} - ${errorMessage}${errorType}`, 'error');
+      }
+
+      if (settings.delayMs > 0 && i < items.length - 1) {
+        await sleep(settings.delayMs);
       }
     }
 
     appendDivider();
-    appendStatus(`Tổng kết: SUCCESS ${summary.success} | SKIP_NO_PERMISSION ${summary.skippedNoPermission} | FAILED ${summary.failed}`, 'section');
+    appendStatus(`Tổng kết: SUCCESS ${summary.success} | SKIP_DONE ${summary.skippedAlreadyDone} | SKIP_NO_PERMISSION ${summary.skippedNoPermission} | FAILED ${summary.failed}`, 'section');
     appendStatus('Đã chạy xong tất cả các dòng.', 'section');
   } catch (err) {
-    setStatusHtml('');
     appendStatus(err.message, 'error');
     console.error(err);
   } finally {
     running = false;
+    els.runFullFlowBtn.disabled = false;
+    els.runFullFlowBtn.textContent = oldButtonText;
   }
 }
-
 
 function openAdsManager() {
   window.open(`${getBackendUrl()}/auth/status`, '_blank');
@@ -427,6 +609,8 @@ els.loginFacebookBtn.addEventListener('click', () => {
 });
 
 els.requestAccessBtn?.addEventListener('click', async () => {
+  if (running) return;
+  running = true;
   try {
     appendDivider();
 
@@ -439,10 +623,11 @@ els.requestAccessBtn?.addEventListener('click', async () => {
     }
 
     await requestPageAccessForItems(pageIds);
-
     appendStatus('Xong. Bấm Check quyền hoặc kiểm tra Business Owned Pages lại.', 'success');
   } catch (err) {
     appendStatus(`Lỗi add/claim Page: ${err.message || 'Unknown error'}`, 'error');
+  } finally {
+    running = false;
   }
 });
 

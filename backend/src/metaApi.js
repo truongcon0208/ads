@@ -5,6 +5,159 @@ function getCurrentUserToken() {
 const API_VERSION = process.env.META_API_VERSION || 'v23.0';
 const BASE_URL = `https://graph.facebook.com/${API_VERSION}`;
 
+
+const DEFAULT_META_MAX_RETRIES = Number(process.env.META_API_MAX_RETRIES || 4);
+const DEFAULT_META_BASE_DELAY_MS = Number(process.env.META_API_BASE_DELAY_MS || 4000);
+const DEFAULT_META_MAX_DELAY_MS = Number(process.env.META_API_MAX_DELAY_MS || 60000);
+const DEFAULT_META_REQUEST_DELAY_MS = Number(process.env.META_API_REQUEST_DELAY_MS || 300);
+const DEFAULT_META_JITTER_MS = Number(process.env.META_API_JITTER_MS || 1000);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function clampNumber(value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+function getRetryDelayMs(attempt) {
+  const baseDelay = clampNumber(DEFAULT_META_BASE_DELAY_MS, 4000, 0, 300000);
+  const maxDelay = clampNumber(DEFAULT_META_MAX_DELAY_MS, 60000, 1000, 600000);
+  const jitter = clampNumber(DEFAULT_META_JITTER_MS, 1000, 0, 10000);
+  const delay = Math.min(maxDelay, baseDelay * Math.pow(2, attempt));
+  return delay + Math.floor(Math.random() * jitter);
+}
+
+function isRateLimitMetaError(meta = {}, message = '') {
+  const code = Number(meta?.code);
+  const subcode = Number(meta?.error_subcode || meta?.subcode);
+  const lower = String(message || meta?.message || '').toLowerCase();
+
+  return (
+    [4, 17, 32, 613, 80004].includes(code) ||
+    [2446079, 1487390].includes(subcode) ||
+    lower.includes('rate limit') ||
+    lower.includes('too many calls') ||
+    lower.includes('temporarily blocked') ||
+    lower.includes('please reduce the amount of data') ||
+    lower.includes('try again later')
+  );
+}
+
+function isRetriableFetchError(err) {
+  const lower = String(err?.message || '').toLowerCase();
+  return (
+    err?.retryable === true ||
+    err?.errorType === 'RATE_LIMIT' ||
+    lower.includes('fetch failed') ||
+    lower.includes('network') ||
+    lower.includes('timeout') ||
+    lower.includes('econnreset') ||
+    lower.includes('etimedout') ||
+    lower.includes('socket')
+  );
+}
+
+function makeMetaError(data, fallbackMessage = 'Meta API request failed') {
+  const meta = data?.error || null;
+  const message =
+    meta?.error_user_title ||
+    meta?.error_user_msg ||
+    meta?.message ||
+    fallbackMessage;
+
+  const err = new Error(message);
+  err.meta = meta;
+  err.errorType = isRateLimitMetaError(meta, message) ? 'RATE_LIMIT' : classifyMetaError(message);
+  err.retryable = err.errorType === 'RATE_LIMIT';
+  return err;
+}
+
+async function parseJsonResponse(response) {
+  const raw = await response.text();
+  if (!raw) return {};
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const err = new Error(`Meta API returned non-JSON response. HTTP ${response.status}`);
+    err.status = response.status;
+    err.retryable = response.status >= 500 || response.status === 429;
+    err.errorType = err.retryable ? 'RATE_LIMIT' : 'UNKNOWN';
+    throw err;
+  }
+}
+
+async function graphFetch(path, { options = {}, fallbackMessage = 'Meta API request failed', accessTokenRequired = true } = {}) {
+  const token = getCurrentUserToken();
+
+  if (accessTokenRequired && !token) {
+    throw new Error('Missing user token. Please connect Facebook again.');
+  }
+
+  const isForm = options.body instanceof URLSearchParams;
+  const headers = {
+    ...(isForm ? {} : { 'Content-Type': 'application/json' }),
+    ...(options.headers || {})
+  };
+
+  const maxRetries = clampNumber(
+    options.maxRetries ?? DEFAULT_META_MAX_RETRIES,
+    DEFAULT_META_MAX_RETRIES,
+    0,
+    10
+  );
+  const requestDelayMs = clampNumber(DEFAULT_META_REQUEST_DELAY_MS, 300, 0, 60000);
+
+  let lastError;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (requestDelayMs > 0) {
+      await sleep(requestDelayMs);
+    }
+
+    try {
+      const response = await fetch(`${BASE_URL}${path}`, {
+        method: options.method || 'GET',
+        headers,
+        body: options.body
+      });
+
+      const data = await parseJsonResponse(response);
+
+      if (!response.ok || data.error) {
+        const err = makeMetaError(data, fallbackMessage);
+        err.status = response.status;
+        err.attempt = attempt + 1;
+
+        // HTTP 429/5xx có thể là nghẽn/rate limit ngay cả khi Meta không trả code rõ ràng.
+        if (response.status === 429 || response.status >= 500) {
+          err.retryable = true;
+          if (err.errorType === 'UNKNOWN') err.errorType = 'RATE_LIMIT';
+        }
+
+        throw err;
+      }
+
+      return data;
+    } catch (err) {
+      lastError = err;
+      const retryable = isRetriableFetchError(err);
+
+      if (!retryable || attempt >= maxRetries) {
+        throw err;
+      }
+
+      await sleep(getRetryDelayMs(attempt));
+    }
+  }
+
+  throw lastError || new Error(fallbackMessage);
+}
+
+
 export function normalizeAdAccountId(adAccountId) {
   const raw = String(adAccountId || '').trim();
   if (!raw) return '';
@@ -19,6 +172,15 @@ export function classifyMetaError(message = '') {
   const lower = String(message || '').toLowerCase();
 
   if (
+    lower.includes('rate limit') ||
+    lower.includes('too many calls') ||
+    lower.includes('temporarily blocked') ||
+    lower.includes('try again later')
+  ) {
+    return 'RATE_LIMIT';
+  }
+
+  if (
     lower.includes('not allowed for this call') ||
     lower.includes('permission') ||
     lower.includes('not authorized') ||
@@ -31,45 +193,16 @@ export function classifyMetaError(message = '') {
   if (lower.includes('invalid') && lower.includes('page')) return 'INVALID_PAGE_ID';
   if (lower.includes('invalid') && lower.includes('account')) return 'INVALID_AD_ACCOUNT_ID';
   if (lower.includes('disabled') || lower.includes('account_status')) return 'AD_ACCOUNT_DISABLED';
-  if (lower.includes('rate limit') || lower.includes('too many calls')) return 'RATE_LIMIT';
 
   return 'UNKNOWN';
 }
 
 async function metaFetch(path, options = {}) {
-  const token = getCurrentUserToken();
-
-  if (!token) {
-    throw new Error('Missing user token. Please connect Facebook again.');
-  }
-
-  const isForm = options.body instanceof URLSearchParams;
-  const headers = {
-    ...(isForm ? {} : { 'Content-Type': 'application/json' }),
-    ...(options.headers || {})
-  };
-
-  const response = await fetch(`${BASE_URL}${path}`, {
-    method: options.method || 'GET',
-    headers,
-    body: options.body
+  return graphFetch(path, {
+    options,
+    fallbackMessage: 'Meta API request failed',
+    accessTokenRequired: true
   });
-
-  const data = await response.json();
-
-  if (!response.ok || data.error) {
-    const err = new Error(
-      data?.error?.error_user_title ||
-      data?.error?.error_user_msg ||
-      data?.error?.message ||
-      'Meta API request failed'
-    );
-    err.meta = data?.error || null;
-    err.errorType = classifyMetaError(err.message);
-    throw err;
-  }
-
-  return data;
 }
 
 async function fetchAllPages(firstPath) {
@@ -329,33 +462,15 @@ export async function createAdDraftWithObjectStoryId({
 }
 
 async function graphFetchWithToken(path, accessToken, options = {}) {
-  const isForm = options.body instanceof URLSearchParams;
-  const headers = {
-    ...(isForm ? {} : { 'Content-Type': 'application/json' }),
-    ...(options.headers || {})
-  };
-
-  const response = await fetch(`${BASE_URL}${path}`, {
-    method: options.method || 'GET',
-    headers,
-    body: options.body
-  });
-
-  const data = await response.json();
-
-  if (!response.ok || data.error) {
-    const err = new Error(
-      data?.error?.error_user_title ||
-      data?.error?.error_user_msg ||
-      data?.error?.message ||
-      'Graph API request failed'
-    );
-    err.meta = data?.error || null;
-    err.errorType = classifyMetaError(err.message);
-    throw err;
+  if (!accessToken) {
+    throw new Error('Missing access token.');
   }
 
-  return data;
+  return graphFetch(path, {
+    options,
+    fallbackMessage: 'Graph API request failed',
+    accessTokenRequired: false
+  });
 }
 
 export async function getPageAccessToken(pageId) {

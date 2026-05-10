@@ -663,6 +663,32 @@
                   <div class="hint">Ví dụ nhập 100 thì toàn bộ danh sách pageId sẽ chạy budget 100.</div>
                 </div>
 
+                <div>
+                  <label for="batchDelayMs">Delay giữa mỗi ID</label>
+                  <div class="input-wrap">
+                    <span class="input-icon">⏱</span>
+                    <input id="batchDelayMs" type="number" min="0" value="3000" placeholder="3000" />
+                  </div>
+                  <div class="hint">Khuyên dùng 3000–10000 ms khi chạy nhiều ID để tránh rate limit.</div>
+                </div>
+
+                <div>
+                  <label for="maxRetries">Retry mỗi ID</label>
+                  <div class="input-wrap">
+                    <span class="input-icon">↻</span>
+                    <input id="maxRetries" type="number" min="0" max="10" value="4" placeholder="4" />
+                  </div>
+                  <div class="hint">Nếu Meta báo limit/lỗi mạng, tool tự đợi rồi chạy lại.</div>
+                </div>
+
+                <div class="full">
+                  <label style="display:flex;align-items:center;gap:10px;font-weight:800;">
+                    <input id="resumeSuccessful" type="checkbox" checked style="width:18px;height:18px;" />
+                    Bỏ qua ID đã thành công khi bấm chạy lại
+                  </label>
+                  <div class="hint">Nếu máy treo/mạng lỗi, mở lại tool và bấm chạy, tool sẽ không chạy lại các ID đã success trong trình duyệt này.</div>
+                </div>
+
                 <div class="full">
                   <label for="batchInput">Danh sách pageId để chạy ads</label>
                   <textarea id="batchInput" placeholder="61551441819219
@@ -686,7 +712,7 @@
 
               <div class="actions">
                 <button id="runFullFlowBtn" class="primary" type="button">
-                  ▶ Chạy full luồng 1-7
+                  ▶ Chạy full luồng an toàn
                 </button>
 
                 <button id="openAdsManagerBtn" class="ghost" type="button">
