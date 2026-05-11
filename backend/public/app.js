@@ -24,8 +24,8 @@ const els = {
 };
 
 const PROGRESS_STORE_KEY = 'botAdsManager.safeRunner.progress.v2';
-const PERMISSION_CHUNK_SIZE = 1;
-const PERMISSION_CHUNK_DELAY_MS = 1200;
+const PERMISSION_CHUNK_SIZE = 10;
+const PERMISSION_CHUNK_DELAY_MS = 1000;
 const FETCH_TIMEOUT_MS = 120000;
 
 function sleep(ms) {
@@ -124,7 +124,7 @@ function backoffDelayMs(attempt, baseDelayMs) {
   return delay + jitter;
 }
 
-async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelayMs = 3000, label = 'request' } = {}) {
+async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelayMs = 3000, label = 'request', allowOkFalse = false } = {}) {
   let lastError;
   const { timeoutMs = FETCH_TIMEOUT_MS, ...fetchOptions } = options || {};
 
@@ -149,7 +149,9 @@ async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelay
         throw err;
       }
 
-      if (!res.ok || data?.ok === false) {
+      // Một số endpoint, ví dụ /permissions/scan, dùng ok=false để báo kết quả nghiệp vụ
+      // như Page/ACT không có quyền. Đây vẫn là response hợp lệ HTTP 200, không phải lỗi request.
+      if (!res.ok || (!allowOkFalse && data?.ok === false)) {
         const err = new Error(data?.error || `HTTP ${res.status}`);
         err.status = res.status;
         err.errorType = data?.errorType || (res.status === 429 || res.status >= 500 ? 'RATE_LIMIT' : 'UNKNOWN');
@@ -366,7 +368,8 @@ async function scanPermissionsForItems(items, { render = true, settings = getRun
     }, {
       maxRetries: settings.maxRetries,
       baseDelayMs: settings.delayMs,
-      label: `Check quyền ${from}-${to}`
+      label: `Check quyền ${from}-${to}`,
+      allowOkFalse: true
     });
 
     if (!merged.adAccount) merged.adAccount = data.adAccount || null;
@@ -510,7 +513,7 @@ async function runFullFlow() {
   running = true;
   els.runFullFlowBtn.disabled = true;
   const oldButtonText = els.runFullFlowBtn.textContent;
-  els.runFullFlowBtn.textContent = 'Đang chạy an toàn...';
+  els.runFullFlowBtn.textContent = 'Đang chạy full luồng...';
 
   setStatusHtml('');
 
@@ -527,23 +530,12 @@ async function runFullFlow() {
     }
 
     appendStatus(`Bắt đầu chạy ${items.length} dòng`, 'section');
-    appendStatus(`Chế độ an toàn: chạy lần lượt từng ID | delay ${settings.delayMs}ms | retry ${settings.maxRetries} lần | resume ${settings.resumeSuccessful ? 'bật' : 'tắt'}`, 'section');
-
-    const permissionScan = await scanPermissionsForItems(items, { render: true, settings });
-    if (!permissionScan.adAccount?.ok) {
-      throw new Error(`Ad Account chưa có quyền trong token/BM: ${els.adAccountId.value.trim()}`);
-    }
-
-    const blockedPageMap = new Map(
-      (permissionScan.pages || [])
-        .filter((x) => !x.ok)
-        .map((x) => [String(x.pageId), x])
-    );
+    appendStatus(`Full luồng KHÔNG check quyền trước | delay ${settings.delayMs}ms | retry ${settings.maxRetries} lần | resume ${settings.resumeSuccessful ? 'bật' : 'tắt'}`, 'section');
+    appendStatus('Nếu Page/ACT thiếu quyền, lỗi sẽ hiện ở đúng dòng đó khi gọi Meta API, không scan trước 1000 ID nữa.', 'running');
 
     const summary = {
       success: 0,
       failed: 0,
-      skippedNoPermission: 0,
       skippedAlreadyDone: 0
     };
 
@@ -553,14 +545,6 @@ async function runFullFlow() {
 
       appendDivider();
       appendStatus(`Dòng ${i + 1}/${items.length}: ${item.pageName} (${item.pageId})`, 'running');
-
-      const blocked = blockedPageMap.get(String(item.pageId));
-      if (blocked) {
-        summary.skippedNoPermission += 1;
-        appendStatus(`${item.pageName} - SKIP: page chưa cấp quyền vào Business/token`, 'error');
-        markProgress(payload, { ok: false, status: 'skipped_no_permission', error: blocked.reason || blocked.error || 'No permission' });
-        continue;
-      }
 
       const existingProgress = getProgress(payload);
       if (settings.resumeSuccessful && existingProgress?.ok) {
@@ -610,7 +594,7 @@ async function runFullFlow() {
     }
 
     appendDivider();
-    appendStatus(`Tổng kết: SUCCESS ${summary.success} | SKIP_DONE ${summary.skippedAlreadyDone} | SKIP_NO_PERMISSION ${summary.skippedNoPermission} | FAILED ${summary.failed}`, 'section');
+    appendStatus(`Tổng kết: SUCCESS ${summary.success} | SKIP_DONE ${summary.skippedAlreadyDone} | FAILED ${summary.failed}`, 'section');
     appendStatus('Đã chạy xong tất cả các dòng.', 'section');
   } catch (err) {
     appendStatus(err.message, 'error');
