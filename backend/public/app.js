@@ -8,6 +8,7 @@ const els = {
   defaultPageName: $('defaultPageName'),
   defaultBudget: $('defaultBudget'),
   batchDelayMs: $('batchDelayMs'),
+  workerCount: $('workerCount'),
   maxRetries: $('maxRetries'),
   resumeSuccessful: $('resumeSuccessful'),
   batchInput: $('batchInput'),
@@ -24,8 +25,8 @@ const els = {
 };
 
 const PROGRESS_STORE_KEY = 'botAdsManager.safeRunner.progress.v2';
-const PERMISSION_CHUNK_SIZE = 10;
-const PERMISSION_CHUNK_DELAY_MS = 1000;
+const PERMISSION_CHUNK_SIZE = 5;
+const PERMISSION_CHUNK_DELAY_MS = 800;
 const FETCH_TIMEOUT_MS = 120000;
 
 function sleep(ms) {
@@ -88,8 +89,9 @@ function getPositiveIntFromInput(input, fallback, min, max) {
 
 function getRunSettings() {
   return {
-    delayMs: getPositiveIntFromInput(els.batchDelayMs, 3000, 0, 300000),
-    maxRetries: getPositiveIntFromInput(els.maxRetries, 4, 0, 10),
+    delayMs: getPositiveIntFromInput(els.batchDelayMs, 800, 0, 300000),
+    workerCount: getPositiveIntFromInput(els.workerCount, 4, 1, 5),
+    maxRetries: getPositiveIntFromInput(els.maxRetries, 3, 0, 10),
     resumeSuccessful: els.resumeSuccessful ? els.resumeSuccessful.checked : true
   };
 }
@@ -124,7 +126,7 @@ function backoffDelayMs(attempt, baseDelayMs) {
   return delay + jitter;
 }
 
-async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelayMs = 3000, label = 'request', allowOkFalse = false } = {}) {
+async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelayMs = 3000, label = 'request' } = {}) {
   let lastError;
   const { timeoutMs = FETCH_TIMEOUT_MS, ...fetchOptions } = options || {};
 
@@ -149,9 +151,7 @@ async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelay
         throw err;
       }
 
-      // Một số endpoint, ví dụ /permissions/scan, dùng ok=false để báo kết quả nghiệp vụ
-      // như Page/ACT không có quyền. Đây vẫn là response hợp lệ HTTP 200, không phải lỗi request.
-      if (!res.ok || (!allowOkFalse && data?.ok === false)) {
+      if (!res.ok || data?.ok === false) {
         const err = new Error(data?.error || `HTTP ${res.status}`);
         err.status = res.status;
         err.errorType = data?.errorType || (res.status === 429 || res.status >= 500 ? 'RATE_LIMIT' : 'UNKNOWN');
@@ -368,8 +368,7 @@ async function scanPermissionsForItems(items, { render = true, settings = getRun
     }, {
       maxRetries: settings.maxRetries,
       baseDelayMs: settings.delayMs,
-      label: `Check quyền ${from}-${to}`,
-      allowOkFalse: true
+      label: `Check quyền ${from}-${to}`
     });
 
     if (!merged.adAccount) merged.adAccount = data.adAccount || null;
@@ -513,7 +512,7 @@ async function runFullFlow() {
   running = true;
   els.runFullFlowBtn.disabled = true;
   const oldButtonText = els.runFullFlowBtn.textContent;
-  els.runFullFlowBtn.textContent = 'Đang chạy full luồng...';
+  els.runFullFlowBtn.textContent = 'Đang tạo job...';
 
   setStatusHtml('');
 
@@ -530,72 +529,121 @@ async function runFullFlow() {
     }
 
     appendStatus(`Bắt đầu chạy ${items.length} dòng`, 'section');
-    appendStatus(`Full luồng KHÔNG check quyền trước | delay ${settings.delayMs}ms | retry ${settings.maxRetries} lần | resume ${settings.resumeSuccessful ? 'bật' : 'tắt'}`, 'section');
-    appendStatus('Nếu Page/ACT thiếu quyền, lỗi sẽ hiện ở đúng dòng đó khi gọi Meta API, không scan trước 1000 ID nữa.', 'running');
+    appendStatus('Full luồng KHÔNG check quyền trước. Dòng nào lỗi quyền sẽ báo lỗi đúng dòng đó.', 'section');
+    appendStatus(`Chế độ job nền: ${settings.workerCount} bàn làm việc | mỗi bàn 1 ID/lần | delay ${settings.delayMs}ms | resume ${settings.resumeSuccessful ? 'bật' : 'tắt'}`, 'section');
 
-    const summary = {
-      success: 0,
-      failed: 0,
-      skippedAlreadyDone: 0
-    };
+    const payloads = [];
+    let skippedAlreadyDone = 0;
 
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
+    for (const item of items) {
       const payload = buildPayloadFromFirstItem(item);
-
-      appendDivider();
-      appendStatus(`Dòng ${i + 1}/${items.length}: ${item.pageName} (${item.pageId})`, 'running');
-
       const existingProgress = getProgress(payload);
+
       if (settings.resumeSuccessful && existingProgress?.ok) {
-        summary.skippedAlreadyDone += 1;
+        skippedAlreadyDone += 1;
         appendStatus(`${item.pageName} - SKIP: đã thành công trước đó (${existingProgress.adId || existingProgress.adSetId || existingProgress.campaignId || 'done'})`, 'success');
         continue;
       }
 
-      try {
-        const data = await fetchJsonWithRetry(`${getBackendUrl()}/flow/run-full-draft`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        }, {
-          maxRetries: settings.maxRetries,
-          baseDelayMs: settings.delayMs,
-          label: `Page ${item.pageId}`
-        });
-
-        summary.success += 1;
-        markProgress(payload, {
-          ok: true,
-          status: 'success',
-          campaignId: data?.campaign?.id || null,
-          adSetId: data?.adSet?.id || null,
-          adId: data?.ad?.id || null,
-          adsManagerUrl: data?.adsManagerUrl || null
-        });
-
-        if (data.adsManagerUrl) {
-          appendNameLink(item.pageName, data.adsManagerUrl);
-        } else {
-          appendStatus(`${item.pageName} - Thành công`, 'success');
-        }
-      } catch (err) {
-        summary.failed += 1;
-        const errorType = err?.errorType ? ` [${err.errorType}]` : '';
-        const backendData = err?.data || null;
-        const errorMessage = backendData?.error || err.message || 'Lỗi backend';
-        markProgress(payload, { ok: false, status: 'failed', error: errorMessage, errorType: err?.errorType || null });
-        appendStatus(`${item.pageName} - ${errorMessage}${errorType}`, 'error');
-      }
-
-      if (settings.delayMs > 0 && i < items.length - 1) {
-        await sleep(settings.delayMs);
-      }
+      payloads.push(payload);
     }
 
-    appendDivider();
-    appendStatus(`Tổng kết: SUCCESS ${summary.success} | SKIP_DONE ${summary.skippedAlreadyDone} | FAILED ${summary.failed}`, 'section');
-    appendStatus('Đã chạy xong tất cả các dòng.', 'section');
+    if (!payloads.length) {
+      appendDivider();
+      appendStatus(`Không còn dòng nào cần chạy. SKIP_DONE ${skippedAlreadyDone}`, 'section');
+      return;
+    }
+
+    const data = await fetchJsonWithRetry(`${getBackendUrl()}/flow/start-full-job`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        payloads,
+        settings: {
+          delayMs: settings.delayMs,
+          concurrency: settings.workerCount,
+          maxRetries: settings.maxRetries,
+          skipped: skippedAlreadyDone
+        }
+      })
+    }, {
+      maxRetries: 1,
+      baseDelayMs: 1500,
+      label: 'Tạo job full luồng'
+    });
+
+    const jobId = data.job?.id;
+    if (!jobId) throw new Error('Backend không trả jobId.');
+
+    appendStatus(`Đã tạo job ${jobId}. Bắt đầu lấy tiến độ...`, 'success');
+    els.runFullFlowBtn.textContent = 'Đang chạy job...';
+
+    let fromEventIndex = 0;
+    let lastProgressText = '';
+
+    while (true) {
+      const statusData = await fetchJsonWithRetry(`${getBackendUrl()}/flow/job-status/${encodeURIComponent(jobId)}?fromEventIndex=${fromEventIndex}`, {
+        method: 'GET',
+        timeoutMs: 20000
+      }, {
+        maxRetries: settings.maxRetries,
+        baseDelayMs: Math.max(1500, settings.delayMs || 1500),
+        label: 'Lấy tiến độ job'
+      });
+
+      const job = statusData.job || {};
+      const events = statusData.events || [];
+      fromEventIndex = statusData.nextEventIndex ?? fromEventIndex;
+
+      for (const event of events) {
+        if (event.type === 'success') {
+          const payload = event.payload || {};
+          const result = event.result || {};
+          markProgress(payload, {
+            ok: true,
+            status: 'success',
+            campaignId: result?.campaign?.id || null,
+            adSetId: result?.adSet?.id || null,
+            adId: result?.ad?.id || null,
+            adsManagerUrl: result?.adsManagerUrl || null
+          });
+
+          if (event.adsManagerUrl) {
+            appendNameLink(event.pageName || event.pageId || 'Page', event.adsManagerUrl);
+          } else {
+            appendStatus(event.message || `${event.pageName || event.pageId} - Thành công`, 'success');
+          }
+        } else if (event.type === 'error') {
+          const payload = event.payload || {};
+          markProgress(payload, {
+            ok: false,
+            status: 'failed',
+            error: event.error || event.message || 'Lỗi backend',
+            errorType: event.errorType || null
+          });
+          appendStatus(event.message || `${event.pageName || event.pageId} - Lỗi`, 'error');
+        } else if (event.type === 'running') {
+          appendStatus(event.message || `Đang chạy dòng ${(event.index || 0) + 1}`, 'running');
+        } else {
+          appendStatus(event.message || 'Cập nhật job', event.type === 'error' ? 'error' : 'section');
+        }
+      }
+
+      const progressText = `Tiến độ job: ${job.completed || 0}/${job.total || payloads.length} | SUCCESS ${job.success || 0} | FAILED ${job.failed || 0} | SKIP_DONE ${skippedAlreadyDone}`;
+      if (progressText !== lastProgressText) {
+        els.runFullFlowBtn.textContent = `Đang chạy ${job.completed || 0}/${job.total || payloads.length}`;
+        lastProgressText = progressText;
+      }
+
+      if (['done', 'failed', 'cancelled'].includes(job.status)) {
+        appendDivider();
+        appendStatus(`Tổng kết: SUCCESS ${job.success || 0} | SKIP_DONE ${skippedAlreadyDone} | FAILED ${job.failed || 0}`, 'section');
+        appendStatus(job.status === 'done' ? 'Đã chạy xong job.' : `Job dừng với trạng thái: ${job.status}`, job.status === 'done' ? 'section' : 'error');
+        break;
+      }
+
+      await sleep(1500);
+    }
   } catch (err) {
     appendStatus(err.message, 'error');
     console.error(err);

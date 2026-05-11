@@ -667,16 +667,25 @@
                   <label for="batchDelayMs">Delay giữa mỗi ID</label>
                   <div class="input-wrap">
                     <span class="input-icon">⏱</span>
-                    <input id="batchDelayMs" type="number" min="0" value="3000" placeholder="3000" />
+                    <input id="batchDelayMs" type="number" min="0" value="800" placeholder="800" />
                   </div>
-                  <div class="hint">Khuyên dùng 3000–10000 ms khi chạy nhiều ID để tránh rate limit.</div>
+                  <div class="hint">Khuyên dùng 500–1500 ms khi chạy 4 bàn; nếu bị limit thì tăng lên 3000 ms.</div>
+                </div>
+
+                <div>
+                  <label for="workerCount">Số bàn làm việc</label>
+                  <div class="input-wrap">
+                    <span class="input-icon">▥</span>
+                    <input id="workerCount" type="number" min="1" max="5" value="4" placeholder="4" />
+                  </div>
+                  <div class="hint">Mặc định 4 bàn: mỗi bàn lấy 1 ID chưa xử lý, xong thì lấy ID tiếp theo. Không chạy trùng ID.</div>
                 </div>
 
                 <div>
                   <label for="maxRetries">Retry mỗi ID</label>
                   <div class="input-wrap">
                     <span class="input-icon">↻</span>
-                    <input id="maxRetries" type="number" min="0" max="10" value="4" placeholder="4" />
+                    <input id="maxRetries" type="number" min="0" max="10" value="3" placeholder="3" />
                   </div>
                   <div class="hint">Nếu Meta báo limit/lỗi mạng, tool tự đợi rồi chạy lại.</div>
                 </div>
@@ -706,13 +715,13 @@
                 <div class="card-icon">⚡</div>
                 <div>
                   <h2 class="card-title">Chạy full luồng</h2>
-                  <p class="card-subtitle">Chạy thẳng bằng Ad Account và danh sách pageId, không check quyền trước.</p>
+                  <p class="card-subtitle">1 input nhiều pageId → backend chia hàng đợi cho các bàn làm việc xử lý song song.</p>
                 </div>
               </div>
 
               <div class="actions">
                 <button id="runFullFlowBtn" class="primary" type="button">
-                  ▶ Chạy full luồng
+                  ▶ Chạy full luồng 4 bàn
                 </button>
 
                 <button id="openAdsManagerBtn" class="ghost" type="button">

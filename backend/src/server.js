@@ -220,141 +220,156 @@ app.post('/flow/create-campaign-and-adset-draft', async (req, res) => {
   }
 });
 
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function clampNumber(value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+async function runFullDraftCore(payload = {}) {
+  const {
+    adAccountId,
+    campaignName,
+    adSetName,
+    adName,
+    objective,
+    dailyBudget,
+    pageId,
+    optimizationGoal,
+    postId,
+    audienceName,
+    placements
+  } = payload;
+
+  if (!adAccountId) throw new Error('Missing adAccountId');
+  if (!campaignName) throw new Error('Missing campaignName');
+  if (!adSetName) throw new Error('Missing adSetName');
+  if (!pageId) throw new Error('Missing pageId');
+  if (!dailyBudget || Number(dailyBudget) <= 0) {
+    throw new Error('Invalid dailyBudget');
+  }
+
+  const campaign = await createCampaignDraft({
+    adAccountId,
+    campaignName,
+    objective,
+    dailyBudget
+  });
+
+  const adSet = await createAdSetDraft({
+    adAccountId,
+    campaignId: campaign.id,
+    adSetName,
+    pageId,
+    optimizationGoal
+  });
+
+  const adSetDetail = await getAdSet(adSet.id);
+
+  let adDetail = null;
+  let pickedPost = null;
+
+  if (postId) {
+    const ad = await createAdDraftWithObjectStoryId({
+      adAccountId,
+      adSetId: adSet.id,
+      adName: adName || `Ad - ${pageId}`,
+      objectStoryId: postId
+    });
+
+    adDetail = await getAd(ad.id);
+    pickedPost = {
+      source: 'input_post_id',
+      id: postId
+    };
+  } else {
+    const picked = await pickFirstValidPostAndCreateAd({
+      adAccountId,
+      adSetId: adSet.id,
+      adName: adName || `Ad - ${pageId}`,
+      pageId,
+      limit: 10
+    });
+
+    adDetail = await getAd(picked.ad.id);
+    pickedPost = picked.pickedPost;
+  }
+
+  if (adDetail?.id) {
+    await updateCampaignStatus({
+      campaignId: campaign.id,
+      status: 'ACTIVE'
+    });
+
+    await updateAdSetStatus({
+      adSetId: adSet.id,
+      status: 'ACTIVE'
+    });
+
+    await updateAdStatus({
+      adId: adDetail.id,
+      status: 'ACTIVE'
+    });
+  }
+
+  const adsManagerUrl = buildAdsManagerUrl({
+    adAccountId,
+    campaignId: campaign.id,
+    adSetId: adSet.id,
+    adId: adDetail?.id
+  });
+
+  return {
+    ok: true,
+    campaign: {
+      id: campaign.id,
+      name: campaignName,
+      status: adDetail?.id ? 'ACTIVE' : 'PAUSED'
+    },
+    adSet: {
+      id: adSetDetail.id,
+      name: adSetDetail.name,
+      status: adDetail?.id ? 'ACTIVE' : adSetDetail.status,
+      optimization_goal: adSetDetail.optimization_goal,
+      destination_type: adSetDetail.destination_type,
+      daily_budget: dailyBudget
+    },
+    ad: adDetail
+      ? {
+          id: adDetail.id,
+          name: adDetail.name,
+          status: 'ACTIVE',
+          adset_id: adDetail.adset_id,
+          campaign_id: adDetail.campaign_id
+        }
+      : null,
+    pickedPost,
+    adsManagerUrl,
+    uiPlan: {
+      audienceName: audienceName || null,
+      placements: placements || null,
+      hasPostSelectionStep: false,
+      hasPublishStep: false
+    },
+    publishResult: adDetail?.id
+      ? {
+          campaignStatus: 'ACTIVE',
+          adSetStatus: 'ACTIVE',
+          adStatus: 'ACTIVE'
+        }
+      : null
+  };
+}
+
 app.post('/flow/run-full-draft', async (req, res) => {
   try {
-    const {
-      adAccountId,
-      campaignName,
-      adSetName,
-      adName,
-      objective,
-      dailyBudget,
-      pageId,
-      optimizationGoal,
-      postId,
-      audienceName,
-      placements
-    } = req.body;
-
-    if (!adAccountId) return res.status(400).json({ error: 'Missing adAccountId' });
-    if (!campaignName) return res.status(400).json({ error: 'Missing campaignName' });
-    if (!adSetName) return res.status(400).json({ error: 'Missing adSetName' });
-    if (!pageId) return res.status(400).json({ error: 'Missing pageId' });
-    if (!dailyBudget || Number(dailyBudget) <= 0) {
-      return res.status(400).json({ error: 'Invalid dailyBudget' });
-    }
-
-    const campaign = await createCampaignDraft({
-      adAccountId,
-      campaignName,
-      objective,
-      dailyBudget
-    });
-
-    const adSet = await createAdSetDraft({
-      adAccountId,
-      campaignId: campaign.id,
-      adSetName,
-      pageId,
-      optimizationGoal
-    });
-
-    const adSetDetail = await getAdSet(adSet.id);
-
-    let adDetail = null;
-    let pickedPost = null;
-
-    if (postId) {
-      const ad = await createAdDraftWithObjectStoryId({
-        adAccountId,
-        adSetId: adSet.id,
-        adName: adName || `Ad - ${pageId}`,
-        objectStoryId: postId
-      });
-
-      adDetail = await getAd(ad.id);
-      pickedPost = {
-        source: 'input_post_id',
-        id: postId
-      };
-    } else {
-      const picked = await pickFirstValidPostAndCreateAd({
-        adAccountId,
-        adSetId: adSet.id,
-        adName: adName || `Ad - ${pageId}`,
-        pageId,
-        limit: 10
-      });
-
-      adDetail = await getAd(picked.ad.id);
-      pickedPost = picked.pickedPost;
-    }
-
-    // PHASE 7: publish bằng API
-    if (adDetail?.id) {
-      await updateCampaignStatus({
-        campaignId: campaign.id,
-        status: 'ACTIVE'
-      });
-
-      await updateAdSetStatus({
-        adSetId: adSet.id,
-        status: 'ACTIVE'
-      });
-
-      await updateAdStatus({
-        adId: adDetail.id,
-        status: 'ACTIVE'
-      });
-    }
-
-    const adsManagerUrl = buildAdsManagerUrl({
-      adAccountId,
-      campaignId: campaign.id,
-      adSetId: adSet.id,
-      adId: adDetail?.id
-    });
-
-    res.json({
-      ok: true,
-      campaign: {
-        id: campaign.id,
-        name: campaignName,
-        status: adDetail?.id ? 'ACTIVE' : 'PAUSED'
-      },
-      adSet: {
-        id: adSetDetail.id,
-        name: adSetDetail.name,
-        status: adDetail?.id ? 'ACTIVE' : adSetDetail.status,
-        optimization_goal: adSetDetail.optimization_goal,
-        destination_type: adSetDetail.destination_type,
-        daily_budget: dailyBudget
-      },
-      ad: adDetail
-        ? {
-            id: adDetail.id,
-            name: adDetail.name,
-            status: 'ACTIVE',
-            adset_id: adDetail.adset_id,
-            campaign_id: adDetail.campaign_id
-          }
-        : null,
-      pickedPost,
-      adsManagerUrl,
-      uiPlan: {
-        audienceName: audienceName || null,
-        placements: placements || null,
-        hasPostSelectionStep: false,
-        hasPublishStep: false
-      },
-      publishResult: adDetail?.id
-        ? {
-            campaignStatus: 'ACTIVE',
-            adSetStatus: 'ACTIVE',
-            adStatus: 'ACTIVE'
-          }
-        : null
-    });
+    const data = await runFullDraftCore(req.body || {});
+    res.json(data);
   } catch (err) {
     res.status(400).json({
       ok: false,
@@ -363,6 +378,315 @@ app.post('/flow/run-full-draft', async (req, res) => {
       meta: err.meta || null
     });
   }
+});
+
+const fullFlowJobs = new Map();
+const MAX_JOB_EVENTS = 3000;
+const MAX_FINISHED_JOBS = 30;
+
+function makeJobId() {
+  return `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function publicJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    total: job.total,
+    completed: job.completed,
+    success: job.success,
+    failed: job.failed,
+    skipped: job.skipped || 0,
+    concurrency: job.concurrency,
+    delayMs: job.delayMs,
+    maxRetries: job.maxRetries,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt || null,
+    error: job.error || null
+  };
+}
+
+function pushJobEvent(job, event) {
+  job.events.push({
+    eventIndex: job.nextEventIndex++,
+    at: new Date().toISOString(),
+    ...event
+  });
+
+  if (job.events.length > MAX_JOB_EVENTS) {
+    job.events.splice(0, job.events.length - MAX_JOB_EVENTS);
+  }
+}
+
+function pruneFinishedJobs() {
+  const finished = [...fullFlowJobs.values()]
+    .filter((job) => ['done', 'failed', 'cancelled'].includes(job.status))
+    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)));
+
+  for (const job of finished.slice(MAX_FINISHED_JOBS)) {
+    fullFlowJobs.delete(job.id);
+  }
+}
+
+function isRetryableJobError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  const type = String(err?.errorType || classifyMetaError(err?.message || '') || '').toUpperCase();
+  const code = Number(err?.meta?.code);
+
+  return (
+    type === 'RATE_LIMIT' ||
+    [4, 17, 32, 613, 80004].includes(code) ||
+    msg.includes('rate limit') ||
+    msg.includes('too many calls') ||
+    msg.includes('temporarily') ||
+    msg.includes('try again later') ||
+    msg.includes('timeout') ||
+    msg.includes('network') ||
+    msg.includes('fetch failed') ||
+    msg.includes('connection') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout')
+  );
+}
+
+function retryDelayMs(attempt, baseDelayMs) {
+  const base = Math.max(1000, Number(baseDelayMs || 1000));
+  const jitter = Math.floor(Math.random() * 1000);
+  return Math.min(90000, base * Math.pow(2, attempt)) + jitter;
+}
+
+async function runPayloadWithRetry({ job, payload, index, workerId, label }) {
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= job.maxRetries; attempt += 1) {
+    try {
+      return await runFullDraftCore(payload);
+    } catch (err) {
+      lastErr = err;
+      const retryable = isRetryableJobError(err);
+
+      if (!retryable || attempt >= job.maxRetries) {
+        throw err;
+      }
+
+      const waitMs = retryDelayMs(attempt, job.delayMs);
+      pushJobEvent(job, {
+        type: 'running',
+        index,
+        workerId,
+        pageId: payload.pageId,
+        pageName: payload.pageName || payload.pageId,
+        message: `[Bàn ${workerId}] ${label} lỗi tạm thời, retry lần ${attempt + 1}/${job.maxRetries} sau ${Math.round(waitMs / 1000)}s: ${err.message || 'lỗi API'}`
+      });
+      await sleep(waitMs);
+    }
+  }
+
+  throw lastErr || new Error('Unknown job error');
+}
+
+async function runFullFlowJob(jobId) {
+  const job = fullFlowJobs.get(jobId);
+  if (!job) return;
+
+  job.status = 'running';
+  job.startedAt = new Date().toISOString();
+  pushJobEvent(job, {
+    type: 'section',
+    message: `Job bắt đầu: ${job.total} dòng | ${job.concurrency} bàn làm việc | mỗi bàn 1 ID/lần | delay ${job.delayMs}ms | retry ${job.maxRetries} | không check quyền trước`
+  });
+
+  let nextIndex = 0;
+
+  async function worker(workerId) {
+    while (true) {
+      if (job.cancelRequested) return;
+      const index = nextIndex++;
+      if (index >= job.payloads.length) return;
+
+      const payload = job.payloads[index];
+      const label = payload.pageName || payload.pageId || `Dòng ${index + 1}`;
+
+      if (job.delayMs > 0 && index > 0) {
+        await sleep(job.delayMs);
+      }
+
+      pushJobEvent(job, {
+        type: 'running',
+        index,
+        workerId,
+        pageId: payload.pageId,
+        pageName: payload.pageName || payload.pageId,
+        message: `[Bàn ${workerId}] Nhận dòng ${index + 1}/${job.total}: ${label} (${payload.pageId})`
+      });
+
+      try {
+        const data = await runPayloadWithRetry({ job, payload, index, workerId, label });
+        job.completed += 1;
+        job.success += 1;
+        job.results[index] = {
+          ok: true,
+          index,
+          pageId: payload.pageId,
+          pageName: payload.pageName || payload.pageId,
+          payload,
+          result: data
+        };
+        pushJobEvent(job, {
+          type: 'success',
+          index,
+          pageId: payload.pageId,
+          pageName: payload.pageName || payload.pageId,
+          payload,
+          result: data,
+          adsManagerUrl: data.adsManagerUrl || null,
+          message: `[Bàn ${workerId}] ${label} - Thành công`
+        });
+      } catch (err) {
+        job.completed += 1;
+        job.failed += 1;
+        const errorType = err.errorType || classifyMetaError(err.message || '');
+        job.results[index] = {
+          ok: false,
+          index,
+          pageId: payload.pageId,
+          pageName: payload.pageName || payload.pageId,
+          payload,
+          error: err.message || 'Lỗi backend',
+          errorType,
+          meta: err.meta || null
+        };
+        pushJobEvent(job, {
+          type: 'error',
+          index,
+          pageId: payload.pageId,
+          pageName: payload.pageName || payload.pageId,
+          payload,
+          error: err.message || 'Lỗi backend',
+          errorType,
+          message: `[Bàn ${workerId}] ${label} - ${err.message || 'Lỗi backend'}${errorType ? ` [${errorType}]` : ''}`
+        });
+      }
+    }
+  }
+
+  try {
+    const workers = Array.from({ length: Math.min(job.concurrency, job.payloads.length) }, (_, i) => worker(i + 1));
+    await Promise.all(workers);
+
+    job.status = job.cancelRequested ? 'cancelled' : 'done';
+    job.finishedAt = new Date().toISOString();
+    pushJobEvent(job, {
+      type: 'section',
+      message: `Job kết thúc: SUCCESS ${job.success} | FAILED ${job.failed} | TOTAL ${job.total}`
+    });
+  } catch (err) {
+    job.status = 'failed';
+    job.error = err.message || 'Job failed';
+    job.finishedAt = new Date().toISOString();
+    pushJobEvent(job, {
+      type: 'error',
+      message: `Job lỗi: ${job.error}`
+    });
+  } finally {
+    pruneFinishedJobs();
+  }
+}
+
+app.post('/flow/start-full-job', async (req, res) => {
+  try {
+    const { payloads, settings = {} } = req.body || {};
+
+    if (!Array.isArray(payloads) || !payloads.length) {
+      return res.status(400).json({ ok: false, error: 'Missing payloads' });
+    }
+
+    if (payloads.length > 5000) {
+      return res.status(400).json({ ok: false, error: 'Quá nhiều dòng trong một job. Chia nhỏ tối đa 5000 dòng/job.' });
+    }
+
+    const concurrency = clampNumber(
+      settings.concurrency ?? process.env.FULL_FLOW_CONCURRENCY,
+      4,
+      1,
+      5
+    );
+    const delayMs = clampNumber(
+      settings.delayMs ?? process.env.FULL_FLOW_DELAY_MS,
+      800,
+      0,
+      300000
+    );
+    const maxRetries = clampNumber(
+      settings.maxRetries ?? process.env.FULL_FLOW_MAX_RETRIES,
+      3,
+      0,
+      10
+    );
+
+    const id = makeJobId();
+    const job = {
+      id,
+      status: 'queued',
+      payloads,
+      total: payloads.length,
+      completed: 0,
+      success: 0,
+      failed: 0,
+      skipped: Number(settings.skipped || 0),
+      concurrency,
+      delayMs,
+      maxRetries,
+      createdAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      cancelRequested: false,
+      error: null,
+      results: new Array(payloads.length),
+      events: [],
+      nextEventIndex: 0
+    };
+
+    fullFlowJobs.set(id, job);
+    setImmediate(() => runFullFlowJob(id));
+
+    return res.json({ ok: true, job: publicJob(job) });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || 'Cannot start job',
+      errorType: err.errorType || classifyMetaError(err.message || '')
+    });
+  }
+});
+
+app.get('/flow/job-status/:jobId', (req, res) => {
+  const job = fullFlowJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ ok: false, error: 'Job not found' });
+  }
+
+  const fromEventIndex = Number(req.query.fromEventIndex || 0);
+  const events = job.events.filter((event) => event.eventIndex >= fromEventIndex);
+  const nextEventIndex = events.length ? events[events.length - 1].eventIndex + 1 : fromEventIndex;
+
+  return res.json({
+    ok: true,
+    job: publicJob(job),
+    events,
+    nextEventIndex
+  });
+});
+
+app.post('/flow/cancel-full-job/:jobId', (req, res) => {
+  const job = fullFlowJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ ok: false, error: 'Job not found' });
+  }
+
+  job.cancelRequested = true;
+  pushJobEvent(job, { type: 'section', message: 'Đã yêu cầu dừng job. Các request đang chạy sẽ hoàn tất rồi dừng.' });
+  return res.json({ ok: true, job: publicJob(job) });
 });
 
 app.post('/adsets/create-draft', async (req, res) => {
