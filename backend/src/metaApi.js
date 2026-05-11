@@ -368,7 +368,7 @@ export async function createCampaignDraft({
   const body = new URLSearchParams({
     name: campaignName,
     objective: objective || 'OUTCOME_ENGAGEMENT',
-    status: 'PAUSED',
+    status: 'ACTIVE',
     special_ad_categories: '[]',
     daily_budget: String(dailyBudget),
     bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
@@ -395,7 +395,7 @@ export async function createAdSetDraft({
     campaign_id: campaignId,
     billing_event: billingEvent,
     optimization_goal: optimizationGoal,
-    status: 'PAUSED',
+    status: 'ACTIVE',
     destination_type: 'MESSENGER',
     promoted_object: JSON.stringify({
       page_id: pageId
@@ -434,7 +434,7 @@ export async function createAdDraft({
   const body = new URLSearchParams({
     name: adName,
     adset_id: adSetId,
-    status: 'PAUSED',
+    status: 'ACTIVE',
     creative: JSON.stringify({
       object_story_id: postId
     }),
@@ -469,7 +469,7 @@ export async function createAdDraftWithObjectStoryId({
   const body = new URLSearchParams({
     name: adName,
     adset_id: adSetId,
-    status: 'PAUSED',
+    status: 'ACTIVE',
     creative: JSON.stringify({
       object_story_id: objectStoryId
     }),
