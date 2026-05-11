@@ -1,9 +1,23 @@
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { appendJobs, readJobs, writeJobs } from './jobStore.js';
+import {
+  saveUltraJob,
+  getUltraJob,
+  listUltraJobs,
+  upsertResumeRecord,
+  bulkUpsertResumeRecords,
+  getResumeRecord,
+  getResumeRecordsForAdAccount,
+  clearResumeRecordsForAdAccount,
+  normalizeAccountKey,
+  initUltraStore,
+  getUltraStoreStatus
+} from './ultraStore.js';
 import {
   createCampaignDraft,
   createAdSetDraft,
@@ -17,6 +31,8 @@ import {
   getAdSet,
   getAd,
   listCampaigns,
+  listAllCampaigns,
+  getCampaign,
   deleteCampaign,
   scanPermissions,
   classifyMetaError,
@@ -58,7 +74,7 @@ function buildAdsManagerUrl({ adAccountId, campaignId, adSetId, adId }) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, store: getUltraStoreStatus() });
 });
 
 app.get('/accounts/:adAccountId', async (req, res) => {
@@ -382,34 +398,62 @@ app.post('/flow/run-full-draft', async (req, res) => {
   }
 });
 
-const fullFlowJobs = new Map();
-const deleteCampaignJobs = new Map();
-const MAX_JOB_EVENTS = 3000;
-const MAX_FINISHED_JOBS = 30;
+
+const runtimeJobs = new Map();
+const MAX_JOB_EVENTS = 5000;
+const MAX_FINISHED_JOBS = 50;
+const DEFAULT_RATE_LIMIT_COOLDOWN_MS = clampNumber(process.env.RATE_LIMIT_COOLDOWN_MS, 10 * 60 * 1000, 60 * 1000, 60 * 60 * 1000);
+const MAX_RATE_LIMIT_COOLDOWN_MS = clampNumber(process.env.MAX_RATE_LIMIT_COOLDOWN_MS, 30 * 60 * 1000, 5 * 60 * 1000, 2 * 60 * 60 * 1000);
 
 function makeJobId() {
   return `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function persistJob(job) {
+  job.updatedAt = new Date().toISOString();
+  runtimeJobs.set(job.id, job);
+  saveUltraJob(job);
+  return job;
+}
+
+function getJobAny(jobId) {
+  const runtime = runtimeJobs.get(jobId);
+  if (runtime) return runtime;
+  const stored = getUltraJob(jobId);
+  if (!stored) return null;
+  runtimeJobs.set(jobId, stored);
+  return stored;
+}
+
 function publicJob(job) {
   return {
     id: job.id,
+    kind: job.kind,
     status: job.status,
     total: job.total,
     completed: job.completed,
     success: job.success,
     failed: job.failed,
     skipped: job.skipped || 0,
+    partial: job.partial || 0,
     concurrency: job.concurrency,
     delayMs: job.delayMs,
     maxRetries: job.maxRetries,
     startedAt: job.startedAt,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
     finishedAt: job.finishedAt || null,
-    error: job.error || null
+    error: job.error || null,
+    rateLimit: job.rateLimit || null,
+    autoResume: job.autoResume !== false,
+    publishActive: Boolean(job.publishActive),
+    progressText: `${job.completed || 0}/${job.total || 0}`
   };
 }
 
-function pushJobEvent(job, event) {
+function pushJobEvent(job, event, { persist = true } = {}) {
+  job.events = Array.isArray(job.events) ? job.events : [];
+  job.nextEventIndex = Number(job.nextEventIndex || 0);
   job.events.push({
     eventIndex: job.nextEventIndex++,
     at: new Date().toISOString(),
@@ -419,350 +463,884 @@ function pushJobEvent(job, event) {
   if (job.events.length > MAX_JOB_EVENTS) {
     job.events.splice(0, job.events.length - MAX_JOB_EVENTS);
   }
+  if (persist) persistJob(job);
 }
 
-function pruneFinishedJobs(jobMap = fullFlowJobs) {
-  const finished = [...jobMap.values()]
-    .filter((job) => ['done', 'failed', 'cancelled'].includes(job.status))
-    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)));
-
-  for (const job of finished.slice(MAX_FINISHED_JOBS)) {
-    jobMap.delete(job.id);
-  }
+function classifyJobError(err) {
+  return err?.errorType || classifyMetaError(err?.message || '') || 'UNKNOWN';
 }
 
-function isRetryableJobError(err) {
+function isRateLimitJobError(err) {
   const msg = String(err?.message || '').toLowerCase();
-  const type = String(err?.errorType || classifyMetaError(err?.message || '') || '').toUpperCase();
+  const type = String(err?.errorType || '').toUpperCase();
   const code = Number(err?.meta?.code);
-
+  const subcode = Number(err?.meta?.error_subcode || err?.meta?.subcode);
   return (
     type === 'RATE_LIMIT' ||
     [4, 17, 32, 613, 80004].includes(code) ||
+    [2446079, 1487390].includes(subcode) ||
+    msg.includes('application request limit reached') ||
     msg.includes('rate limit') ||
     msg.includes('too many calls') ||
-    msg.includes('temporarily') ||
+    msg.includes('temporarily blocked') ||
     msg.includes('try again later') ||
+    msg.includes('please reduce the amount of data')
+  );
+}
+
+function isRetryableNetworkJobError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  return (
     msg.includes('timeout') ||
     msg.includes('network') ||
     msg.includes('fetch failed') ||
     msg.includes('connection') ||
     msg.includes('econnreset') ||
-    msg.includes('etimedout')
+    msg.includes('etimedout') ||
+    msg.includes('socket')
   );
 }
 
 function retryDelayMs(attempt, baseDelayMs) {
   const base = Math.max(1000, Number(baseDelayMs || 1000));
   const jitter = Math.floor(Math.random() * 1000);
-  return Math.min(90000, base * Math.pow(2, attempt)) + jitter;
+  return Math.min(120000, base * Math.pow(2, attempt)) + jitter;
 }
 
-async function runPayloadWithRetry({ job, payload, index, workerId, label }) {
-  let lastErr = null;
+function getRateLimitCooldownMs(job) {
+  const base = clampNumber(job.rateLimitCooldownMs, DEFAULT_RATE_LIMIT_COOLDOWN_MS, 60 * 1000, 2 * 60 * 60 * 1000);
+  const hitCount = Number(job.rateLimit?.hitCount || 0);
+  const multiplier = Math.min(4, Math.max(1, hitCount));
+  const jitter = Math.floor(Math.random() * 30000);
+  return Math.min(MAX_RATE_LIMIT_COOLDOWN_MS, base * multiplier) + jitter;
+}
 
-  for (let attempt = 0; attempt <= job.maxRetries; attempt += 1) {
+function markGlobalRateLimit(job, err, { workerId, item } = {}) {
+  const cooldownMs = getRateLimitCooldownMs(job);
+  const cooldownUntilMs = Date.now() + cooldownMs;
+  job.status = 'rate_limited';
+  job.rateLimit = {
+    active: true,
+    hitCount: Number(job.rateLimit?.hitCount || 0) + 1,
+    cooldownMs,
+    cooldownUntil: new Date(cooldownUntilMs).toISOString(),
+    lastError: err?.message || 'Rate limit',
+    lastMeta: err?.meta || null
+  };
+
+  if (item && item.status === 'processing') {
+    item.status = 'pending';
+    item.workerId = null;
+    item.lastError = err?.message || 'Rate limit';
+    item.errorType = 'RATE_LIMIT';
+  }
+
+  pushJobEvent(job, {
+    type: 'rate_limit',
+    workerId,
+    pageId: item?.payload?.pageId || null,
+    message: `⚠️ Gặp Meta rate limit (#4). Tạm dừng toàn bộ job ${Math.round(cooldownMs / 60000)} phút, không đánh FAILED và sẽ tự chạy tiếp.`
+  });
+}
+
+async function waitForManualPauseOrRateLimit(job, workerId) {
+  while (true) {
+    if (job.cancelRequested || job.status === 'cancelled') return false;
+
+    if (job.status === 'paused') {
+      await sleep(3000);
+      continue;
+    }
+
+    if (job.status === 'rate_limited') {
+      const until = Date.parse(job.rateLimit?.cooldownUntil || '');
+      const waitMs = Number.isFinite(until) ? until - Date.now() : 60_000;
+      if (waitMs > 0) {
+        await sleep(Math.min(waitMs, 30_000));
+        continue;
+      }
+
+      // Hết thời gian cooldown: test bằng 1 request nhẹ trước khi chạy tiếp.
+      try {
+        pushJobEvent(job, {
+          type: 'running',
+          workerId,
+          message: `⏳ Hết cooldown, test quota bằng request nhẹ trước khi resume...`
+        });
+        const adAccountId = job.adAccountId || job.payloads?.[0]?.adAccountId;
+        if (adAccountId) await getAdAccount(adAccountId);
+        job.status = 'running';
+        job.rateLimit = {
+          ...(job.rateLimit || {}),
+          active: false,
+          resumedAt: new Date().toISOString()
+        };
+        pushJobEvent(job, {
+          type: 'section',
+          workerId,
+          message: `✅ Quota đã hồi. Job tự chạy tiếp từ dòng chưa xong.`
+        });
+        persistJob(job);
+        return true;
+      } catch (err) {
+        if (isRateLimitJobError(err)) {
+          markGlobalRateLimit(job, err, { workerId });
+          continue;
+        }
+        // Lỗi test không phải limit thì đừng kẹt vô hạn.
+        job.status = 'running';
+        pushJobEvent(job, {
+          type: 'running',
+          workerId,
+          message: `⚠️ Test quota lỗi không phải limit (${err.message || 'unknown'}), thử chạy tiếp thận trọng.`
+        });
+        persistJob(job);
+        return true;
+      }
+    }
+
+    return true;
+  }
+}
+
+function hasPendingItems(job) {
+  return (job.items || []).some((item) => item.status === 'pending');
+}
+
+function claimNextItem(job, workerId) {
+  const item = (job.items || []).find((x) => x.status === 'pending');
+  if (!item) return null;
+  item.status = 'processing';
+  item.workerId = workerId;
+  item.startedAt = new Date().toISOString();
+  return item;
+}
+
+function buildSuccessResult({ job, payload, checkpoint, adSetDetail, adDetail, pickedPost }) {
+  const adsManagerUrl = buildAdsManagerUrl({
+    adAccountId: payload.adAccountId,
+    campaignId: checkpoint.campaignId,
+    adSetId: checkpoint.adSetId,
+    adId: checkpoint.adId
+  });
+
+  return {
+    ok: true,
+    campaign: {
+      id: checkpoint.campaignId,
+      name: payload.campaignName,
+      status: job.publishActive ? 'ACTIVE' : 'PAUSED'
+    },
+    adSet: {
+      id: checkpoint.adSetId,
+      name: adSetDetail?.name || payload.adSetName,
+      status: job.publishActive ? 'ACTIVE' : (adSetDetail?.status || 'PAUSED'),
+      optimization_goal: adSetDetail?.optimization_goal || payload.optimizationGoal,
+      destination_type: adSetDetail?.destination_type || 'MESSENGER',
+      daily_budget: payload.dailyBudget
+    },
+    ad: checkpoint.adId
+      ? {
+          id: checkpoint.adId,
+          name: adDetail?.name || payload.adName,
+          status: job.publishActive ? 'ACTIVE' : (adDetail?.status || 'PAUSED'),
+          adset_id: checkpoint.adSetId,
+          campaign_id: checkpoint.campaignId
+        }
+      : null,
+    pickedPost: pickedPost || checkpoint.pickedPost || null,
+    adsManagerUrl,
+    publishResult: job.publishActive
+      ? { campaignStatus: 'ACTIVE', adSetStatus: 'ACTIVE', adStatus: 'ACTIVE' }
+      : { campaignStatus: 'PAUSED', adSetStatus: 'PAUSED', adStatus: 'PAUSED' }
+  };
+}
+
+async function runFullItemCheckpointed({ job, item, workerId }) {
+  const payload = item.payload;
+  const label = payload.pageName || payload.pageId || `Dòng ${item.index + 1}`;
+  item.checkpoint = item.checkpoint || {};
+  const checkpoint = item.checkpoint;
+
+  // Backend resume chống trùng: nếu từng có campaign/adset/ad thì reuse, không tạo lại camp.
+  const existing = getResumeRecord(payload.adAccountId, payload.pageId);
+  if (existing?.campaignId && !checkpoint.campaignId) {
+    checkpoint.campaignId = existing.campaignId;
+    checkpoint.adSetId = existing.adSetId || null;
+    checkpoint.adId = existing.adId || null;
+    checkpoint.reusedFromResume = true;
+    pushJobEvent(job, {
+      type: 'running',
+      workerId,
+      index: item.index,
+      pageId: payload.pageId,
+      message: `[Bàn ${workerId}] ${label} - Reuse campaign đã có trong resume (${existing.campaignId})`
+    });
+  }
+
+  if (existing?.status === 'success' && existing?.campaignId && existing?.adSetId && existing?.adId) {
+    const result = buildSuccessResult({ job, payload, checkpoint: { ...checkpoint, ...existing }, adSetDetail: null, adDetail: null });
+    return { skipped: true, result, checkpoint: { ...checkpoint, ...existing } };
+  }
+
+  if (!checkpoint.campaignId) {
+    const campaign = await createCampaignDraft({
+      adAccountId: payload.adAccountId,
+      campaignName: payload.campaignName,
+      objective: payload.objective,
+      dailyBudget: payload.dailyBudget
+    });
+    checkpoint.campaignId = campaign.id;
+    checkpoint.campaignCreatedAt = new Date().toISOString();
+    upsertResumeRecord({
+      adAccountId: payload.adAccountId,
+      pageId: payload.pageId,
+      pageName: payload.pageName,
+      campaignId: campaign.id,
+      campaignName: payload.campaignName,
+      status: 'campaign_created',
+      source: 'job_partial',
+      adsManagerUrl: buildAdsManagerUrl({ adAccountId: payload.adAccountId, campaignId: campaign.id })
+    });
+    pushJobEvent(job, {
+      type: 'running',
+      workerId,
+      index: item.index,
+      pageId: payload.pageId,
+      message: `[Bàn ${workerId}] ${label} - Đã tạo campaign ${campaign.id}, lưu checkpoint`
+    });
+    persistJob(job);
+  }
+
+  if (!checkpoint.adSetId) {
+    const adSet = await createAdSetDraft({
+      adAccountId: payload.adAccountId,
+      campaignId: checkpoint.campaignId,
+      adSetName: payload.adSetName,
+      pageId: payload.pageId,
+      optimizationGoal: payload.optimizationGoal
+    });
+    checkpoint.adSetId = adSet.id;
+    checkpoint.adSetCreatedAt = new Date().toISOString();
+    upsertResumeRecord({
+      adAccountId: payload.adAccountId,
+      pageId: payload.pageId,
+      pageName: payload.pageName,
+      campaignId: checkpoint.campaignId,
+      campaignName: payload.campaignName,
+      adSetId: checkpoint.adSetId,
+      status: 'adset_created',
+      source: 'job_partial',
+      adsManagerUrl: buildAdsManagerUrl({ adAccountId: payload.adAccountId, campaignId: checkpoint.campaignId, adSetId: checkpoint.adSetId })
+    });
+    pushJobEvent(job, {
+      type: 'running',
+      workerId,
+      index: item.index,
+      pageId: payload.pageId,
+      message: `[Bàn ${workerId}] ${label} - Đã tạo adset ${adSet.id}, lưu checkpoint`
+    });
+    persistJob(job);
+  }
+
+  let adSetDetail = null;
+  try {
+    adSetDetail = await getAdSet(checkpoint.adSetId);
+  } catch (err) {
+    if (isRateLimitJobError(err)) throw err;
+    // Không chặn job chỉ vì verify adset bị lỗi nhẹ.
+    pushJobEvent(job, {
+      type: 'running',
+      workerId,
+      index: item.index,
+      pageId: payload.pageId,
+      message: `[Bàn ${workerId}] ${label} - Không đọc lại được adset, vẫn chạy tiếp: ${err.message || 'verify lỗi'}`
+    });
+  }
+
+  let pickedPost = checkpoint.pickedPost || null;
+  let adDetail = null;
+
+  if (!checkpoint.adId) {
+    if (payload.postId) {
+      const ad = await createAdDraftWithObjectStoryId({
+        adAccountId: payload.adAccountId,
+        adSetId: checkpoint.adSetId,
+        adName: payload.adName || `Ad - ${payload.pageId}`,
+        objectStoryId: payload.postId
+      });
+      checkpoint.adId = ad.id;
+      pickedPost = { source: 'input_post_id', id: payload.postId };
+      checkpoint.pickedPost = pickedPost;
+    } else {
+      const picked = await pickFirstValidPostAndCreateAd({
+        adAccountId: payload.adAccountId,
+        adSetId: checkpoint.adSetId,
+        adName: payload.adName || `Ad - ${payload.pageId}`,
+        pageId: payload.pageId,
+        limit: 10
+      });
+      checkpoint.adId = picked.ad.id;
+      pickedPost = picked.pickedPost;
+      checkpoint.pickedPost = pickedPost;
+    }
+
+    checkpoint.adCreatedAt = new Date().toISOString();
+    upsertResumeRecord({
+      adAccountId: payload.adAccountId,
+      pageId: payload.pageId,
+      pageName: payload.pageName,
+      campaignId: checkpoint.campaignId,
+      campaignName: payload.campaignName,
+      adSetId: checkpoint.adSetId,
+      adId: checkpoint.adId,
+      status: 'ad_created',
+      source: 'job_partial',
+      adsManagerUrl: buildAdsManagerUrl({ adAccountId: payload.adAccountId, campaignId: checkpoint.campaignId, adSetId: checkpoint.adSetId, adId: checkpoint.adId })
+    });
+    pushJobEvent(job, {
+      type: 'running',
+      workerId,
+      index: item.index,
+      pageId: payload.pageId,
+      message: `[Bàn ${workerId}] ${label} - Đã tạo ad ${checkpoint.adId}, lưu checkpoint`
+    });
+    persistJob(job);
+  }
+
+  try {
+    adDetail = await getAd(checkpoint.adId);
+  } catch (err) {
+    if (isRateLimitJobError(err)) throw err;
+    pushJobEvent(job, {
+      type: 'running',
+      workerId,
+      index: item.index,
+      pageId: payload.pageId,
+      message: `[Bàn ${workerId}] ${label} - Không đọc lại được ad, vẫn lưu success: ${err.message || 'verify lỗi'}`
+    });
+  }
+
+  if (job.publishActive) {
+    await updateCampaignStatus({ campaignId: checkpoint.campaignId, status: 'ACTIVE' });
+    await updateAdSetStatus({ adSetId: checkpoint.adSetId, status: 'ACTIVE' });
+    if (checkpoint.adId) await updateAdStatus({ adId: checkpoint.adId, status: 'ACTIVE' });
+  }
+
+  const result = buildSuccessResult({ job, payload, checkpoint, adSetDetail, adDetail, pickedPost });
+  upsertResumeRecord({
+    adAccountId: payload.adAccountId,
+    pageId: payload.pageId,
+    pageName: payload.pageName,
+    campaignId: checkpoint.campaignId,
+    campaignName: payload.campaignName,
+    adSetId: checkpoint.adSetId,
+    adId: checkpoint.adId,
+    status: 'success',
+    source: 'job_success',
+    adsManagerUrl: result.adsManagerUrl
+  });
+
+  return { skipped: false, result, checkpoint };
+}
+
+async function processFullItemWithSmartRetry({ job, item, workerId }) {
+  let lastErr = null;
+  for (let attempt = Number(item.attempts || 0); attempt <= job.maxRetries; attempt += 1) {
+    item.attempts = attempt;
     try {
-      return await runFullDraftCore(payload);
+      return await runFullItemCheckpointed({ job, item, workerId });
     } catch (err) {
       lastErr = err;
-      const retryable = isRetryableJobError(err);
+      item.lastError = err.message || 'Lỗi backend';
+      item.errorType = classifyJobError(err);
 
-      if (!retryable || attempt >= job.maxRetries) {
-        throw err;
+      if (isRateLimitJobError(err)) {
+        markGlobalRateLimit(job, err, { workerId, item });
+        return { rateLimited: true };
       }
+
+      const retryable = isRetryableNetworkJobError(err);
+      if (!retryable || attempt >= job.maxRetries) throw err;
 
       const waitMs = retryDelayMs(attempt, job.delayMs);
       pushJobEvent(job, {
         type: 'running',
-        index,
+        index: item.index,
         workerId,
-        pageId: payload.pageId,
-        pageName: payload.pageName || payload.pageId,
-        message: `[Bàn ${workerId}] ${label} lỗi tạm thời, retry lần ${attempt + 1}/${job.maxRetries} sau ${Math.round(waitMs / 1000)}s: ${err.message || 'lỗi API'}`
+        pageId: item.payload.pageId,
+        message: `[Bàn ${workerId}] ${item.payload.pageName || item.payload.pageId} lỗi mạng/tạm thời, retry lần ${attempt + 1}/${job.maxRetries} sau ${Math.round(waitMs / 1000)}s: ${err.message || 'lỗi API'}`
       });
       await sleep(waitMs);
     }
   }
-
   throw lastErr || new Error('Unknown job error');
 }
 
 async function runFullFlowJob(jobId) {
-  const job = fullFlowJobs.get(jobId);
-  if (!job) return;
-
-  job.status = 'running';
-  job.startedAt = new Date().toISOString();
+  const job = getJobAny(jobId);
+  if (!job || job.runnerActive) return;
+  job.runnerActive = true;
+  job.status = job.status === 'queued' ? 'running' : job.status;
+  job.startedAt = job.startedAt || new Date().toISOString();
   pushJobEvent(job, {
     type: 'section',
-    message: `Job bắt đầu: ${job.total} dòng | ${job.concurrency} bàn làm việc | mỗi bàn 1 ID/lần | delay ${job.delayMs}ms | retry ${job.maxRetries} | không check quyền trước`
+    message: `Job bắt đầu/tiếp tục: ${job.total} dòng | ${job.concurrency} bàn làm việc | mỗi bàn 1 ID/lần | delay ${job.delayMs}ms | retry ${job.maxRetries} | rate-limit auto pause ${Math.round((job.rateLimitCooldownMs || DEFAULT_RATE_LIMIT_COOLDOWN_MS) / 60000)} phút | campaign ${job.publishActive ? 'ACTIVE' : 'PAUSED'}`
   });
-
-  let nextIndex = 0;
 
   async function worker(workerId) {
     while (true) {
-      if (job.cancelRequested) return;
-      const index = nextIndex++;
-      if (index >= job.payloads.length) return;
+      if (!(await waitForManualPauseOrRateLimit(job, workerId))) return;
+      if (job.cancelRequested || job.status === 'cancelled') return;
+      if (job.status !== 'running') return;
 
-      const payload = job.payloads[index];
-      const label = payload.pageName || payload.pageId || `Dòng ${index + 1}`;
+      const item = claimNextItem(job, workerId);
+      if (!item) return;
 
-      if (job.delayMs > 0 && index > 0) {
+      const payload = item.payload;
+      const label = payload.pageName || payload.pageId || `Dòng ${item.index + 1}`;
+
+      if (job.delayMs > 0 && item.index > 0) {
         await sleep(job.delayMs);
       }
 
       pushJobEvent(job, {
         type: 'running',
-        index,
+        index: item.index,
         workerId,
         pageId: payload.pageId,
         pageName: payload.pageName || payload.pageId,
-        message: `[Bàn ${workerId}] Nhận dòng ${index + 1}/${job.total}: ${label} (${payload.pageId})`
+        message: `[Bàn ${workerId}] Nhận dòng ${item.index + 1}/${job.total}: ${label} (${payload.pageId})`
       });
 
       try {
-        const data = await runPayloadWithRetry({ job, payload, index, workerId, label });
+        const data = await processFullItemWithSmartRetry({ job, item, workerId });
+        if (data?.rateLimited) continue;
+
+        item.status = data.skipped ? 'skipped' : 'success';
+        item.finishedAt = new Date().toISOString();
+        item.result = data.result;
+        item.checkpoint = data.checkpoint || item.checkpoint;
         job.completed += 1;
-        job.success += 1;
-        job.results[index] = {
+        if (data.skipped) job.skipped += 1;
+        else job.success += 1;
+        job.results[item.index] = {
           ok: true,
-          index,
+          skipped: Boolean(data.skipped),
+          index: item.index,
           pageId: payload.pageId,
           pageName: payload.pageName || payload.pageId,
           payload,
-          result: data
+          result: data.result
         };
         pushJobEvent(job, {
-          type: 'success',
-          index,
+          type: data.skipped ? 'skipped' : 'success',
+          index: item.index,
           pageId: payload.pageId,
           pageName: payload.pageName || payload.pageId,
           payload,
-          result: data,
-          adsManagerUrl: data.adsManagerUrl || null,
-          message: `[Bàn ${workerId}] ${label} - Thành công`
+          result: data.result,
+          adsManagerUrl: data.result?.adsManagerUrl || null,
+          message: `[Bàn ${workerId}] ${label} - ${data.skipped ? 'SKIP backend resume' : 'Thành công'}`
         });
       } catch (err) {
+        item.status = 'failed';
+        item.finishedAt = new Date().toISOString();
+        item.error = err.message || 'Lỗi backend';
+        item.errorType = classifyJobError(err);
         job.completed += 1;
         job.failed += 1;
-        const errorType = err.errorType || classifyMetaError(err.message || '');
-        job.results[index] = {
+        job.results[item.index] = {
           ok: false,
-          index,
+          index: item.index,
           pageId: payload.pageId,
           pageName: payload.pageName || payload.pageId,
           payload,
+          checkpoint: item.checkpoint || {},
           error: err.message || 'Lỗi backend',
-          errorType,
+          errorType: item.errorType,
           meta: err.meta || null
         };
         pushJobEvent(job, {
           type: 'error',
-          index,
+          index: item.index,
           pageId: payload.pageId,
           pageName: payload.pageName || payload.pageId,
           payload,
           error: err.message || 'Lỗi backend',
-          errorType,
-          message: `[Bàn ${workerId}] ${label} - ${err.message || 'Lỗi backend'}${errorType ? ` [${errorType}]` : ''}`
+          errorType: item.errorType,
+          message: `[Bàn ${workerId}] ${label} - ${err.message || 'Lỗi backend'}${item.errorType ? ` [${item.errorType}]` : ''}`
         });
       }
+      persistJob(job);
     }
   }
 
   try {
-    const workers = Array.from({ length: Math.min(job.concurrency, job.payloads.length) }, (_, i) => worker(i + 1));
+    const workers = Array.from({ length: Math.min(job.concurrency, job.items.filter((x) => x.status === 'pending').length || 1) }, (_, i) => worker(i + 1));
     await Promise.all(workers);
 
-    job.status = job.cancelRequested ? 'cancelled' : 'done';
-    job.finishedAt = new Date().toISOString();
-    pushJobEvent(job, {
-      type: 'section',
-      message: `Job kết thúc: SUCCESS ${job.success} | FAILED ${job.failed} | TOTAL ${job.total}`
-    });
+    if (job.cancelRequested || job.status === 'cancelled') {
+      job.status = 'cancelled';
+      job.finishedAt = new Date().toISOString();
+      pushJobEvent(job, { type: 'section', message: `Job đã dừng theo yêu cầu. SUCCESS ${job.success} | FAILED ${job.failed} | SKIPPED ${job.skipped} | TOTAL ${job.total}` });
+    } else if (job.status === 'paused' || job.status === 'rate_limited') {
+      pushJobEvent(job, { type: 'section', message: `Job đang ${job.status === 'paused' ? 'tạm dừng thủ công' : 'chờ hết rate limit'}, có thể resume tiếp.` });
+    } else if (!hasPendingItems(job)) {
+      job.status = 'done';
+      job.finishedAt = new Date().toISOString();
+      pushJobEvent(job, { type: 'section', message: `Job kết thúc: SUCCESS ${job.success} | SKIPPED ${job.skipped} | FAILED ${job.failed} | TOTAL ${job.total}` });
+    }
   } catch (err) {
     job.status = 'failed';
     job.error = err.message || 'Job failed';
     job.finishedAt = new Date().toISOString();
-    pushJobEvent(job, {
-      type: 'error',
-      message: `Job lỗi: ${job.error}`
-    });
+    pushJobEvent(job, { type: 'error', message: `Job lỗi: ${job.error}` });
   } finally {
-    pruneFinishedJobs();
+    job.runnerActive = false;
+    persistJob(job);
   }
 }
 
+function parseAutoPageIdFromCampaignName(name = '') {
+  const text = String(name || '');
+  if (!/^AUTO\s+/i.test(text)) return null;
+  const nums = [...text.matchAll(/\d{8,}/g)].map((m) => m[0]);
+  if (!nums.length) return null;
+  return nums[nums.length - 1];
+}
 
-async function deleteCampaignWithRetry({ job, campaignId, index, workerId }) {
-  let lastErr = null;
+app.post('/flow/sync-existing-campaigns', async (req, res) => {
+  try {
+    const { adAccountId, pageIds = [], clearBeforeSync = false } = req.body || {};
+    if (!adAccountId) return res.status(400).json({ ok: false, error: 'Missing adAccountId' });
 
-  for (let attempt = 0; attempt <= job.maxRetries; attempt += 1) {
+    const wanted = new Set((Array.isArray(pageIds) ? pageIds : []).map((x) => String(x || '').trim()).filter(Boolean));
+    if (clearBeforeSync) clearResumeRecordsForAdAccount(adAccountId);
+
+    const campaigns = await listAllCampaigns(adAccountId);
+    const matches = [];
+
+    for (const c of campaigns) {
+      const pageId = parseAutoPageIdFromCampaignName(c.name);
+      if (!pageId) continue;
+      if (wanted.size && !wanted.has(pageId)) continue;
+      matches.push({
+        adAccountId,
+        pageId,
+        pageName: pageId,
+        campaignId: c.id,
+        campaignName: c.name,
+        status: c.effective_status === 'DELETED' || c.status === 'DELETED' ? 'deleted' : 'campaign_existing',
+        source: 'sync_existing_campaigns',
+        raw: c,
+        adsManagerUrl: buildAdsManagerUrl({ adAccountId, campaignId: c.id })
+      });
+    }
+
+    const activeMatches = matches.filter((x) => x.status !== 'deleted');
+    const saved = bulkUpsertResumeRecords(activeMatches);
+    return res.json({
+      ok: true,
+      scanned: campaigns.length,
+      matched: matches.length,
+      saved: saved.length,
+      deletedIgnored: matches.length - activeMatches.length,
+      records: saved
+    });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err.message || 'Sync existing campaigns failed',
+      errorType: classifyJobError(err),
+      meta: err.meta || null
+    });
+  }
+});
+
+app.get('/flow/resume-records', (req, res) => {
+  const { adAccountId } = req.query;
+  if (!adAccountId) return res.status(400).json({ ok: false, error: 'Missing adAccountId' });
+  const records = getResumeRecordsForAdAccount(adAccountId);
+  return res.json({ ok: true, total: records.length, records });
+});
+
+app.get('/flow/jobs', (req, res) => {
+  const kind = req.query.kind || 'full_flow';
+  const jobs = listUltraJobs({ kind, limit: clampNumber(req.query.limit, 20, 1, 100) }).map(publicJob);
+  return res.json({ ok: true, jobs });
+});
+
+app.post('/flow/start-full-job', async (req, res) => {
+  try {
+    const { payloads, settings = {} } = req.body || {};
+    if (!Array.isArray(payloads) || !payloads.length) {
+      return res.status(400).json({ ok: false, error: 'Missing payloads' });
+    }
+    if (payloads.length > 5000) {
+      return res.status(400).json({ ok: false, error: 'Quá nhiều dòng trong một job. Chia nhỏ tối đa 5000 dòng/job.' });
+    }
+
+    const concurrency = clampNumber(settings.concurrency ?? process.env.FULL_FLOW_CONCURRENCY, 4, 1, 8);
+    const delayMs = clampNumber(settings.delayMs ?? process.env.FULL_FLOW_DELAY_MS, 3000, 0, 300000);
+    const maxRetries = clampNumber(settings.maxRetries ?? process.env.FULL_FLOW_MAX_RETRIES, 2, 0, 10);
+    const rateLimitCooldownMs = clampNumber(settings.rateLimitCooldownMs ?? process.env.RATE_LIMIT_COOLDOWN_MS, DEFAULT_RATE_LIMIT_COOLDOWN_MS, 60 * 1000, 2 * 60 * 60 * 1000);
+    const publishActive = Boolean(settings.publishActive);
+
+    const cleanPayloads = [];
+    const seen = new Set();
+    for (const payload of payloads) {
+      const pageId = String(payload?.pageId || '').trim();
+      const adAccountId = String(payload?.adAccountId || '').trim();
+      if (!pageId || !adAccountId) continue;
+      const key = `${normalizeAccountKey(adAccountId)}::${pageId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cleanPayloads.push({ ...payload, pageId, adAccountId, publishActive });
+    }
+
+    const id = makeJobId();
+    const job = {
+      id,
+      kind: 'full_flow',
+      status: 'queued',
+      adAccountId: cleanPayloads[0]?.adAccountId || null,
+      payloads: cleanPayloads,
+      items: cleanPayloads.map((payload, index) => {
+        const existing = getResumeRecord(payload.adAccountId, payload.pageId);
+        const shouldSkip = settings.skipBackendSuccess !== false && existing?.status === 'success' && existing?.campaignId && existing?.adSetId && existing?.adId;
+        return {
+          index,
+          payload,
+          status: shouldSkip ? 'pending' : 'pending',
+          attempts: 0,
+          checkpoint: existing?.campaignId ? {
+            campaignId: existing.campaignId,
+            adSetId: existing.adSetId || null,
+            adId: existing.adId || null,
+            reusedFromResume: true
+          } : {},
+          existingResume: existing || null
+        };
+      }),
+      total: cleanPayloads.length,
+      completed: 0,
+      success: 0,
+      failed: 0,
+      skipped: Number(settings.skipped || 0),
+      partial: 0,
+      concurrency,
+      delayMs,
+      maxRetries,
+      rateLimitCooldownMs,
+      publishActive,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      cancelRequested: false,
+      pauseRequested: false,
+      autoResume: true,
+      runnerActive: false,
+      error: null,
+      rateLimit: null,
+      results: new Array(cleanPayloads.length),
+      events: [],
+      nextEventIndex: 0
+    };
+
+    persistJob(job);
+    setImmediate(() => runFullFlowJob(id));
+    return res.json({ ok: true, job: publicJob(job) });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || 'Cannot start job',
+      errorType: classifyJobError(err),
+      meta: err.meta || null
+    });
+  }
+});
+
+app.get('/flow/job-status/:jobId', (req, res) => {
+  const job = getJobAny(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, error: 'Job not found' });
+
+  if ((job.status === 'queued' || job.status === 'rate_limited' || job.status === 'running') && !job.runnerActive && hasPendingItems(job)) {
+    setImmediate(() => runFullFlowJob(job.id));
+  }
+
+  const fromEventIndex = Number(req.query.fromEventIndex || 0);
+  const events = (job.events || []).filter((event) => event.eventIndex >= fromEventIndex);
+  const nextEventIndex = events.length ? events[events.length - 1].eventIndex + 1 : fromEventIndex;
+  return res.json({ ok: true, job: publicJob(job), events, nextEventIndex });
+});
+
+app.post('/flow/pause-full-job/:jobId', (req, res) => {
+  const job = getJobAny(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, error: 'Job not found' });
+  if (!['done', 'failed', 'cancelled'].includes(job.status)) {
+    job.status = 'paused';
+    job.pauseRequested = true;
+    pushJobEvent(job, { type: 'section', message: '⏸ Đã tạm dừng job. Các request đang chạy sẽ hoàn tất rồi đứng lại.' });
+  }
+  return res.json({ ok: true, job: publicJob(job) });
+});
+
+app.post('/flow/resume-full-job/:jobId', (req, res) => {
+  const job = getJobAny(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, error: 'Job not found' });
+  if (['done', 'failed', 'cancelled'].includes(job.status)) {
+    return res.status(400).json({ ok: false, error: `Job đã ${job.status}, không resume được.` });
+  }
+  for (const item of job.items || []) {
+    if (item.status === 'processing') item.status = 'pending';
+  }
+  job.status = 'running';
+  job.pauseRequested = false;
+  job.cancelRequested = false;
+  job.rateLimit = job.rateLimit ? { ...job.rateLimit, active: false } : null;
+  pushJobEvent(job, { type: 'section', message: '▶ Resume job. Tool chạy tiếp từ ID chưa xong, không chạy lại ID success.' });
+  persistJob(job);
+  setImmediate(() => runFullFlowJob(job.id));
+  return res.json({ ok: true, job: publicJob(job) });
+});
+
+app.post('/flow/cancel-full-job/:jobId', (req, res) => {
+  const job = getJobAny(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, error: 'Job not found' });
+  job.cancelRequested = true;
+  job.status = 'cancelled';
+  for (const item of job.items || []) {
+    if (item.status === 'processing') item.status = 'pending';
+  }
+  pushJobEvent(job, { type: 'section', message: '🛑 Đã yêu cầu dừng hẳn job. Các dòng success vẫn được lưu resume.' });
+  persistJob(job);
+  return res.json({ ok: true, job: publicJob(job) });
+});
+
+async function deleteCampaignWithVerify({ job, campaignId }) {
+  const result = await deleteCampaign({ campaignId });
+  let verify = null;
+  try {
+    verify = await getCampaign(campaignId);
+  } catch (err) {
+    const msg = String(err?.message || '').toLowerCase();
+    if (isRateLimitJobError(err)) throw err;
+    if (msg.includes('does not exist') || msg.includes('cannot be loaded') || msg.includes('unsupported delete request')) {
+      return { ...result, verified: true, verifyStatus: 'not_loadable_after_delete' };
+    }
+    return { ...result, verified: false, verifyError: err.message || 'verify failed' };
+  }
+  return {
+    ...result,
+    verified: verify?.effective_status === 'DELETED' || verify?.status === 'DELETED',
+    verify
+  };
+}
+
+async function processDeleteItemWithSmartRetry({ job, item, workerId }) {
+  for (let attempt = Number(item.attempts || 0); attempt <= job.maxRetries; attempt += 1) {
+    item.attempts = attempt;
     try {
-      return await deleteCampaign({ campaignId });
+      return await deleteCampaignWithVerify({ job, campaignId: item.campaignId });
     } catch (err) {
-      lastErr = err;
-      const retryable = isRetryableJobError(err);
-
-      if (!retryable || attempt >= job.maxRetries) {
-        throw err;
+      item.lastError = err.message || 'Lỗi xóa campaign';
+      item.errorType = classifyJobError(err);
+      if (isRateLimitJobError(err)) {
+        markGlobalRateLimit(job, err, { workerId, item });
+        return { rateLimited: true };
       }
-
+      const retryable = isRetryableNetworkJobError(err);
+      if (!retryable || attempt >= job.maxRetries) throw err;
       const waitMs = retryDelayMs(attempt, job.delayMs);
       pushJobEvent(job, {
         type: 'running',
-        index,
         workerId,
-        campaignId,
-        message: `[Bàn ${workerId}] Campaign ${campaignId} lỗi tạm thời, retry lần ${attempt + 1}/${job.maxRetries} sau ${Math.round(waitMs / 1000)}s: ${err.message || 'lỗi API'}`
+        campaignId: item.campaignId,
+        message: `[Bàn ${workerId}] Campaign ${item.campaignId} lỗi tạm thời, retry lần ${attempt + 1}/${job.maxRetries} sau ${Math.round(waitMs / 1000)}s: ${err.message || 'lỗi API'}`
       });
       await sleep(waitMs);
     }
   }
-
-  throw lastErr || new Error('Unknown delete campaign error');
+  throw new Error('Unknown delete campaign error');
 }
 
 async function runDeleteCampaignJob(jobId) {
-  const job = deleteCampaignJobs.get(jobId);
-  if (!job) return;
-
-  job.status = 'running';
-  job.startedAt = new Date().toISOString();
-  pushJobEvent(job, {
-    type: 'section',
-    message: `Job xóa campaign bắt đầu: ${job.total} campaign | ${job.concurrency} bàn làm việc | mỗi bàn 1 campaign/lần | delay ${job.delayMs}ms | retry ${job.maxRetries}`
-  });
-
-  let nextIndex = 0;
+  const job = getJobAny(jobId);
+  if (!job || job.runnerActive) return;
+  job.runnerActive = true;
+  job.status = job.status === 'queued' ? 'running' : job.status;
+  job.startedAt = job.startedAt || new Date().toISOString();
+  pushJobEvent(job, { type: 'section', message: `Job xóa campaign bắt đầu/tiếp tục: ${job.total} campaign | ${job.concurrency} bàn | delay ${job.delayMs}ms | retry ${job.maxRetries}` });
 
   async function worker(workerId) {
     while (true) {
-      if (job.cancelRequested) return;
-      const index = nextIndex++;
-      if (index >= job.campaignIds.length) return;
-
-      const campaignId = job.campaignIds[index];
-
-      if (job.delayMs > 0 && index > 0) {
-        await sleep(job.delayMs);
-      }
-
-      pushJobEvent(job, {
-        type: 'running',
-        index,
-        workerId,
-        campaignId,
-        message: `[Bàn ${workerId}] Nhận campaign ${index + 1}/${job.total}: ${campaignId}`
-      });
-
+      if (!(await waitForManualPauseOrRateLimit(job, workerId))) return;
+      if (job.cancelRequested || job.status === 'cancelled' || job.status !== 'running') return;
+      const item = (job.items || []).find((x) => x.status === 'pending');
+      if (!item) return;
+      item.status = 'processing';
+      item.workerId = workerId;
+      if (job.delayMs > 0 && item.index > 0) await sleep(job.delayMs);
+      pushJobEvent(job, { type: 'running', index: item.index, workerId, campaignId: item.campaignId, message: `[Bàn ${workerId}] Nhận campaign ${item.index + 1}/${job.total}: ${item.campaignId}` });
       try {
-        const result = await deleteCampaignWithRetry({ job, campaignId, index, workerId });
+        const result = await processDeleteItemWithSmartRetry({ job, item, workerId });
+        if (result?.rateLimited) continue;
+        item.status = 'success';
+        item.result = result;
+        item.finishedAt = new Date().toISOString();
         job.completed += 1;
         job.success += 1;
-        job.results[index] = {
-          ok: true,
-          index,
-          campaignId,
-          result
-        };
-        pushJobEvent(job, {
-          type: 'success',
-          index,
-          campaignId,
-          result,
-          message: `[Bàn ${workerId}] ${campaignId} - Đã xóa bằng API`
-        });
+        job.results[item.index] = { ok: true, index: item.index, campaignId: item.campaignId, result };
+        pushJobEvent(job, { type: 'success', index: item.index, campaignId: item.campaignId, result, message: `[Bàn ${workerId}] ${item.campaignId} - Đã xóa bằng API${result.verified ? ' + verify OK' : ''}` });
       } catch (err) {
+        item.status = 'failed';
+        item.error = err.message || 'Lỗi backend';
+        item.errorType = classifyJobError(err);
+        item.finishedAt = new Date().toISOString();
         job.completed += 1;
         job.failed += 1;
-        const errorType = err.errorType || classifyMetaError(err.message || '');
-        job.results[index] = {
-          ok: false,
-          index,
-          campaignId,
-          error: err.message || 'Lỗi backend',
-          errorType,
-          meta: err.meta || null
-        };
-        pushJobEvent(job, {
-          type: 'error',
-          index,
-          campaignId,
-          error: err.message || 'Lỗi backend',
-          errorType,
-          message: `[Bàn ${workerId}] ${campaignId} - Xóa lỗi: ${err.message || 'Lỗi backend'}${errorType ? ` [${errorType}]` : ''}`
-        });
+        job.results[item.index] = { ok: false, index: item.index, campaignId: item.campaignId, error: item.error, errorType: item.errorType, meta: err.meta || null };
+        pushJobEvent(job, { type: 'error', index: item.index, campaignId: item.campaignId, error: item.error, errorType: item.errorType, message: `[Bàn ${workerId}] ${item.campaignId} - Xóa lỗi: ${item.error}${item.errorType ? ` [${item.errorType}]` : ''}` });
       }
+      persistJob(job);
     }
   }
 
   try {
-    const workers = Array.from({ length: Math.min(job.concurrency, job.campaignIds.length) }, (_, i) => worker(i + 1));
+    const workers = Array.from({ length: Math.min(job.concurrency, job.items.filter((x) => x.status === 'pending').length || 1) }, (_, i) => worker(i + 1));
     await Promise.all(workers);
-
-    job.status = job.cancelRequested ? 'cancelled' : 'done';
-    job.finishedAt = new Date().toISOString();
-    pushJobEvent(job, {
-      type: 'section',
-      message: `Job xóa campaign kết thúc: SUCCESS ${job.success} | FAILED ${job.failed} | TOTAL ${job.total}`
-    });
-  } catch (err) {
-    job.status = 'failed';
-    job.error = err.message || 'Delete campaign job failed';
-    job.finishedAt = new Date().toISOString();
-    pushJobEvent(job, {
-      type: 'error',
-      message: `Job xóa campaign lỗi: ${job.error}`
-    });
+    if (job.cancelRequested || job.status === 'cancelled') {
+      job.status = 'cancelled';
+      job.finishedAt = new Date().toISOString();
+      pushJobEvent(job, { type: 'section', message: `Job xóa đã dừng: SUCCESS ${job.success} | FAILED ${job.failed} | TOTAL ${job.total}` });
+    } else if (job.status === 'paused' || job.status === 'rate_limited') {
+      pushJobEvent(job, { type: 'section', message: `Job xóa đang ${job.status}. Có thể resume tiếp.` });
+    } else if (!hasPendingItems(job)) {
+      job.status = 'done';
+      job.finishedAt = new Date().toISOString();
+      pushJobEvent(job, { type: 'section', message: `Job xóa campaign kết thúc: SUCCESS ${job.success} | FAILED ${job.failed} | TOTAL ${job.total}` });
+    }
   } finally {
-    pruneFinishedJobs(deleteCampaignJobs);
+    job.runnerActive = false;
+    persistJob(job);
   }
 }
 
 app.post('/campaigns/start-delete-job', async (req, res) => {
   try {
     const { campaignIds, settings = {} } = req.body || {};
+    if (!Array.isArray(campaignIds) || !campaignIds.length) return res.status(400).json({ ok: false, error: 'Missing campaignIds' });
+    if (campaignIds.length > 5000) return res.status(400).json({ ok: false, error: 'Quá nhiều campaign trong một job. Chia nhỏ tối đa 5000 campaign/job.' });
 
-    if (!Array.isArray(campaignIds) || !campaignIds.length) {
-      return res.status(400).json({ ok: false, error: 'Missing campaignIds' });
-    }
+    const cleanCampaignIds = [...new Set(campaignIds.map((id) => String(id || '').trim().replace(/^act_/, '')).filter((id) => /^\d{8,}$/.test(id)))];
+    if (!cleanCampaignIds.length) return res.status(400).json({ ok: false, error: 'Không có campaign_id hợp lệ để xóa.' });
 
-    if (campaignIds.length > 5000) {
-      return res.status(400).json({ ok: false, error: 'Quá nhiều campaign trong một job. Chia nhỏ tối đa 5000 campaign/job.' });
-    }
-
-    const cleanCampaignIds = [...new Set(
-      campaignIds
-        .map((id) => String(id || '').trim().replace(/^act_/, ''))
-        .filter((id) => /^\d{8,}$/.test(id))
-    )];
-
-    if (!cleanCampaignIds.length) {
-      return res.status(400).json({ ok: false, error: 'Không có campaign_id hợp lệ để xóa.' });
-    }
-
-    const concurrency = clampNumber(
-      settings.concurrency ?? process.env.DELETE_CAMPAIGN_CONCURRENCY,
-      4,
-      1,
-      5
-    );
-    const delayMs = clampNumber(
-      settings.delayMs ?? process.env.DELETE_CAMPAIGN_DELAY_MS,
-      800,
-      0,
-      300000
-    );
-    const maxRetries = clampNumber(
-      settings.maxRetries ?? process.env.DELETE_CAMPAIGN_MAX_RETRIES,
-      3,
-      0,
-      10
-    );
+    const concurrency = clampNumber(settings.concurrency ?? process.env.DELETE_CAMPAIGN_CONCURRENCY, 4, 1, 8);
+    const delayMs = clampNumber(settings.delayMs ?? process.env.DELETE_CAMPAIGN_DELAY_MS, 3000, 0, 300000);
+    const maxRetries = clampNumber(settings.maxRetries ?? process.env.DELETE_CAMPAIGN_MAX_RETRIES, 2, 0, 10);
+    const rateLimitCooldownMs = clampNumber(settings.rateLimitCooldownMs ?? process.env.RATE_LIMIT_COOLDOWN_MS, DEFAULT_RATE_LIMIT_COOLDOWN_MS, 60 * 1000, 2 * 60 * 60 * 1000);
 
     const id = makeJobId();
     const job = {
@@ -770,6 +1348,7 @@ app.post('/campaigns/start-delete-job', async (req, res) => {
       kind: 'delete_campaigns',
       status: 'queued',
       campaignIds: cleanCampaignIds,
+      items: cleanCampaignIds.map((campaignId, index) => ({ index, campaignId, status: 'pending', attempts: 0 })),
       total: cleanCampaignIds.length,
       completed: 0,
       success: 0,
@@ -778,151 +1357,70 @@ app.post('/campaigns/start-delete-job', async (req, res) => {
       concurrency,
       delayMs,
       maxRetries,
+      rateLimitCooldownMs,
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       startedAt: null,
       finishedAt: null,
       cancelRequested: false,
+      pauseRequested: false,
+      autoResume: true,
+      runnerActive: false,
       error: null,
+      rateLimit: null,
       results: new Array(cleanCampaignIds.length),
       events: [],
       nextEventIndex: 0
     };
-
-    deleteCampaignJobs.set(id, job);
+    persistJob(job);
     setImmediate(() => runDeleteCampaignJob(id));
-
     return res.json({ ok: true, job: publicJob(job) });
   } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message || 'Cannot start delete campaign job',
-      errorType: err.errorType || classifyMetaError(err.message || '')
-    });
+    return res.status(500).json({ ok: false, error: err.message || 'Cannot start delete campaign job', errorType: classifyJobError(err), meta: err.meta || null });
   }
 });
 
 app.get('/campaigns/delete-job-status/:jobId', (req, res) => {
-  const job = deleteCampaignJobs.get(req.params.jobId);
-  if (!job) {
-    return res.status(404).json({ ok: false, error: 'Delete campaign job not found' });
-  }
-
+  const job = getJobAny(req.params.jobId);
+  if (!job || job.kind !== 'delete_campaigns') return res.status(404).json({ ok: false, error: 'Delete campaign job not found' });
+  if ((job.status === 'queued' || job.status === 'rate_limited' || job.status === 'running') && !job.runnerActive && hasPendingItems(job)) setImmediate(() => runDeleteCampaignJob(job.id));
   const fromEventIndex = Number(req.query.fromEventIndex || 0);
-  const events = job.events.filter((event) => event.eventIndex >= fromEventIndex);
+  const events = (job.events || []).filter((event) => event.eventIndex >= fromEventIndex);
   const nextEventIndex = events.length ? events[events.length - 1].eventIndex + 1 : fromEventIndex;
-
-  return res.json({
-    ok: true,
-    job: publicJob(job),
-    events,
-    nextEventIndex
-  });
+  return res.json({ ok: true, job: publicJob(job), events, nextEventIndex });
 });
 
-app.post('/campaigns/cancel-delete-job/:jobId', (req, res) => {
-  const job = deleteCampaignJobs.get(req.params.jobId);
-  if (!job) {
-    return res.status(404).json({ ok: false, error: 'Delete campaign job not found' });
+app.post('/campaigns/pause-delete-job/:jobId', (req, res) => {
+  const job = getJobAny(req.params.jobId);
+  if (!job || job.kind !== 'delete_campaigns') return res.status(404).json({ ok: false, error: 'Delete campaign job not found' });
+  if (!['done', 'failed', 'cancelled'].includes(job.status)) {
+    job.status = 'paused';
+    pushJobEvent(job, { type: 'section', message: '⏸ Đã tạm dừng job xóa.' });
   }
-
-  job.cancelRequested = true;
-  pushJobEvent(job, { type: 'section', message: 'Đã yêu cầu dừng job xóa. Các request đang chạy sẽ hoàn tất rồi dừng.' });
   return res.json({ ok: true, job: publicJob(job) });
 });
 
-app.post('/flow/start-full-job', async (req, res) => {
-  try {
-    const { payloads, settings = {} } = req.body || {};
-
-    if (!Array.isArray(payloads) || !payloads.length) {
-      return res.status(400).json({ ok: false, error: 'Missing payloads' });
-    }
-
-    if (payloads.length > 5000) {
-      return res.status(400).json({ ok: false, error: 'Quá nhiều dòng trong một job. Chia nhỏ tối đa 5000 dòng/job.' });
-    }
-
-    const concurrency = clampNumber(
-      settings.concurrency ?? process.env.FULL_FLOW_CONCURRENCY,
-      4,
-      1,
-      5
-    );
-    const delayMs = clampNumber(
-      settings.delayMs ?? process.env.FULL_FLOW_DELAY_MS,
-      800,
-      0,
-      300000
-    );
-    const maxRetries = clampNumber(
-      settings.maxRetries ?? process.env.FULL_FLOW_MAX_RETRIES,
-      3,
-      0,
-      10
-    );
-
-    const id = makeJobId();
-    const job = {
-      id,
-      status: 'queued',
-      payloads,
-      total: payloads.length,
-      completed: 0,
-      success: 0,
-      failed: 0,
-      skipped: Number(settings.skipped || 0),
-      concurrency,
-      delayMs,
-      maxRetries,
-      createdAt: new Date().toISOString(),
-      startedAt: null,
-      finishedAt: null,
-      cancelRequested: false,
-      error: null,
-      results: new Array(payloads.length),
-      events: [],
-      nextEventIndex: 0
-    };
-
-    fullFlowJobs.set(id, job);
-    setImmediate(() => runFullFlowJob(id));
-
-    return res.json({ ok: true, job: publicJob(job) });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message || 'Cannot start job',
-      errorType: err.errorType || classifyMetaError(err.message || '')
-    });
-  }
+app.post('/campaigns/resume-delete-job/:jobId', (req, res) => {
+  const job = getJobAny(req.params.jobId);
+  if (!job || job.kind !== 'delete_campaigns') return res.status(404).json({ ok: false, error: 'Delete campaign job not found' });
+  for (const item of job.items || []) if (item.status === 'processing') item.status = 'pending';
+  job.status = 'running';
+  job.cancelRequested = false;
+  job.rateLimit = job.rateLimit ? { ...job.rateLimit, active: false } : null;
+  pushJobEvent(job, { type: 'section', message: '▶ Resume job xóa campaign.' });
+  persistJob(job);
+  setImmediate(() => runDeleteCampaignJob(job.id));
+  return res.json({ ok: true, job: publicJob(job) });
 });
 
-app.get('/flow/job-status/:jobId', (req, res) => {
-  const job = fullFlowJobs.get(req.params.jobId);
-  if (!job) {
-    return res.status(404).json({ ok: false, error: 'Job not found' });
-  }
-
-  const fromEventIndex = Number(req.query.fromEventIndex || 0);
-  const events = job.events.filter((event) => event.eventIndex >= fromEventIndex);
-  const nextEventIndex = events.length ? events[events.length - 1].eventIndex + 1 : fromEventIndex;
-
-  return res.json({
-    ok: true,
-    job: publicJob(job),
-    events,
-    nextEventIndex
-  });
-});
-
-app.post('/flow/cancel-full-job/:jobId', (req, res) => {
-  const job = fullFlowJobs.get(req.params.jobId);
-  if (!job) {
-    return res.status(404).json({ ok: false, error: 'Job not found' });
-  }
-
+app.post('/campaigns/cancel-delete-job/:jobId', (req, res) => {
+  const job = getJobAny(req.params.jobId);
+  if (!job || job.kind !== 'delete_campaigns') return res.status(404).json({ ok: false, error: 'Delete campaign job not found' });
   job.cancelRequested = true;
-  pushJobEvent(job, { type: 'section', message: 'Đã yêu cầu dừng job. Các request đang chạy sẽ hoàn tất rồi dừng.' });
+  job.status = 'cancelled';
+  for (const item of job.items || []) if (item.status === 'processing') item.status = 'pending';
+  pushJobEvent(job, { type: 'section', message: '🛑 Đã yêu cầu dừng job xóa. Các request đang chạy sẽ hoàn tất rồi dừng.' });
+  persistJob(job);
   return res.json({ ok: true, job: publicJob(job) });
 });
 
@@ -1496,6 +1994,8 @@ app.post('/auth/logout', (_req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
+
+await initUltraStore();
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend listening on port ${PORT}`);
