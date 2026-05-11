@@ -144,6 +144,13 @@ async function graphFetch(path, { options = {}, fallbackMessage = 'Meta API requ
       return data;
     } catch (err) {
       lastError = err;
+
+      // Với rate limit thật (#4/613/80004...), đẩy lỗi ra job manager ngay
+      // để pause toàn job theo phút. Không retry âm thầm ở tầng Meta API.
+      if (err?.errorType === 'RATE_LIMIT') {
+        throw err;
+      }
+
       const retryable = isRetriableFetchError(err);
 
       if (!retryable || attempt >= maxRetries) {
@@ -333,7 +340,21 @@ export async function getAdAccount(adAccountId) {
 export async function listCampaigns(adAccountId) {
   const normalized = normalizeAdAccountId(adAccountId);
   return metaFetch(
-    `/${normalized}/campaigns?fields=id,name,status&access_token=${encodeURIComponent(getCurrentUserToken())}`
+    `/${normalized}/campaigns?fields=id,name,status,effective_status,created_time,updated_time&limit=500&access_token=${encodeURIComponent(getCurrentUserToken())}`
+  );
+}
+
+export async function listAllCampaigns(adAccountId) {
+  const normalized = normalizeAdAccountId(adAccountId);
+  return fetchAllPages(
+    `/${normalized}/campaigns?fields=id,name,status,effective_status,created_time,updated_time&limit=500&access_token=${encodeURIComponent(getCurrentUserToken())}`
+  );
+}
+
+export async function getCampaign(campaignId) {
+  const cleanCampaignId = normalizeNumericId(campaignId);
+  return metaFetch(
+    `/${cleanCampaignId}?fields=id,name,status,effective_status&access_token=${encodeURIComponent(getCurrentUserToken())}`
   );
 }
 
