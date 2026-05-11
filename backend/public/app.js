@@ -21,7 +21,9 @@ const els = {
   loginFacebookBtn: $('loginFacebookBtn'),
   businessId: $('businessId'),
   requestAccessBtn: $('requestAccessBtn'),
-  permissionInput: $('permissionInput')
+  permissionInput: $('permissionInput'),
+  deleteCampaignInput: $('deleteCampaignInput'),
+  deleteCampaignBtn: $('deleteCampaignBtn')
 };
 
 const PROGRESS_STORE_KEY = 'botAdsManager.safeRunner.progress.v2';
@@ -507,6 +509,155 @@ async function requestPageAccessForItems(pageIds = []) {
   return { ok: failed.length === 0, total: pageIds.length, success: success.length, failed: failed.length, results: allResults };
 }
 
+
+function parseCampaignIdsInput(raw) {
+  const lines = String(raw || '').split('\n').map((s) => s.trim()).filter(Boolean);
+  const campaignIds = [];
+  const errors = [];
+
+  for (const [index, line] of lines.entries()) {
+    let picked = '';
+
+    const campaignLike = line.match(/(?:campaign[_\s-]*id|campaign|camp)[^0-9]*(\d{8,})/i);
+    if (campaignLike) picked = campaignLike[1];
+
+    if (!picked) {
+      const parentheses = [...line.matchAll(/\((\d{8,})\)/g)].map((m) => m[1]);
+      if (parentheses.length) picked = parentheses[parentheses.length - 1];
+    }
+
+    if (!picked) {
+      const nums = [...line.matchAll(/\d{8,}/g)].map((m) => m[0]);
+      if (nums.length === 1) {
+        picked = nums[0];
+      } else if (nums.length > 1) {
+        const longest = nums.slice().sort((a, b) => b.length - a.length)[0];
+        const sameLongest = nums.filter((n) => n.length === longest.length);
+        if (sameLongest.length === 1 && longest.length >= 15) {
+          picked = longest;
+        } else {
+          errors.push(`Dòng ${index + 1} có nhiều ID, hãy chỉ để campaign_id: ${line}`);
+          continue;
+        }
+      }
+    }
+
+    if (!picked || !/^\d{8,}$/.test(picked)) {
+      errors.push(`Dòng ${index + 1} không có campaign_id hợp lệ: ${line}`);
+      continue;
+    }
+
+    campaignIds.push(picked);
+  }
+
+  return {
+    campaignIds: [...new Set(campaignIds)],
+    errors
+  };
+}
+
+async function deleteCampaignsByApi() {
+  if (running) return;
+  running = true;
+  els.deleteCampaignBtn.disabled = true;
+  const oldButtonText = els.deleteCampaignBtn.textContent;
+  els.deleteCampaignBtn.textContent = 'Đang tạo job xóa...';
+
+  setStatusHtml('');
+
+  try {
+    const settings = getRunSettings();
+    const { campaignIds, errors } = parseCampaignIdsInput(els.deleteCampaignInput?.value || '');
+
+    if (errors.length) {
+      throw new Error(`Lỗi input campaign_id:\n${errors.slice(0, 30).join('\n')}${errors.length > 30 ? `\n... còn ${errors.length - 30} dòng lỗi` : ''}`);
+    }
+
+    if (!campaignIds.length) {
+      throw new Error('Chưa có campaign_id hợp lệ để xóa. Dán campaign_id dạng 120244... mỗi dòng 1 ID.');
+    }
+
+    appendStatus(`Bắt đầu xóa ${campaignIds.length} campaign bằng API`, 'section');
+    appendStatus(`Chế độ job nền: ${settings.workerCount} bàn làm việc | mỗi bàn 1 campaign/lần | delay ${settings.delayMs}ms | retry ${settings.maxRetries}`, 'section');
+    appendStatus('Lưu ý: đây là xóa campaign theo campaign_id thật, không phải pageId trong tên campaign.', 'running');
+
+    const data = await fetchJsonWithRetry(`${getBackendUrl()}/campaigns/start-delete-job`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        campaignIds,
+        settings: {
+          delayMs: settings.delayMs,
+          concurrency: settings.workerCount,
+          maxRetries: settings.maxRetries
+        }
+      })
+    }, {
+      maxRetries: 1,
+      baseDelayMs: 1500,
+      label: 'Tạo job xóa campaign'
+    });
+
+    const jobId = data.job?.id;
+    if (!jobId) throw new Error('Backend không trả jobId xóa campaign.');
+
+    appendStatus(`Đã tạo job xóa ${jobId}. Bắt đầu lấy tiến độ...`, 'success');
+    els.deleteCampaignBtn.textContent = 'Đang xóa...';
+
+    let fromEventIndex = 0;
+    let lastProgressText = '';
+
+    while (true) {
+      const statusData = await fetchJsonWithRetry(`${getBackendUrl()}/campaigns/delete-job-status/${encodeURIComponent(jobId)}?fromEventIndex=${fromEventIndex}`, {
+        method: 'GET',
+        timeoutMs: 20000
+      }, {
+        maxRetries: settings.maxRetries,
+        baseDelayMs: Math.max(1500, settings.delayMs || 1500),
+        label: 'Lấy tiến độ job xóa'
+      });
+
+      const job = statusData.job || {};
+      const events = statusData.events || [];
+      fromEventIndex = statusData.nextEventIndex ?? fromEventIndex;
+
+      for (const event of events) {
+        if (event.type === 'success') {
+          appendStatus(event.message || `${event.campaignId} - Đã xóa`, 'success');
+        } else if (event.type === 'error') {
+          appendStatus(event.message || `${event.campaignId} - Xóa lỗi`, 'error');
+        } else if (event.type === 'running') {
+          appendStatus(event.message || `Đang xóa campaign ${(event.index || 0) + 1}`, 'running');
+        } else {
+          appendStatus(event.message || 'Cập nhật job xóa', event.type === 'error' ? 'error' : 'section');
+        }
+      }
+
+      const progressText = `Tiến độ xóa: ${job.completed || 0}/${job.total || campaignIds.length} | SUCCESS ${job.success || 0} | FAILED ${job.failed || 0}`;
+      if (progressText !== lastProgressText) {
+        els.deleteCampaignBtn.textContent = `Đang xóa ${job.completed || 0}/${job.total || campaignIds.length}`;
+        lastProgressText = progressText;
+      }
+
+      if (['done', 'failed', 'cancelled'].includes(job.status)) {
+        appendDivider();
+        appendStatus(`Tổng kết xóa: SUCCESS ${job.success || 0} | FAILED ${job.failed || 0}`, 'section');
+        appendStatus(job.status === 'done' ? 'Đã chạy xong job xóa campaign.' : `Job xóa dừng với trạng thái: ${job.status}`, job.status === 'done' ? 'section' : 'error');
+        break;
+      }
+
+      await sleep(1500);
+    }
+  } catch (err) {
+    appendStatus(err.message, 'error');
+    console.error(err);
+  } finally {
+    running = false;
+    els.deleteCampaignBtn.disabled = false;
+    els.deleteCampaignBtn.textContent = oldButtonText;
+  }
+}
+
 async function runFullFlow() {
   if (running) return;
   running = true;
@@ -687,6 +838,7 @@ els.requestAccessBtn?.addEventListener('click', async () => {
 
 els.permissionCheckBtn.addEventListener('click', checkPermissionsOnly);
 els.runFullFlowBtn.addEventListener('click', runFullFlow);
+els.deleteCampaignBtn?.addEventListener('click', deleteCampaignsByApi);
 els.openAdsManagerBtn.addEventListener('click', openAdsManager);
 els.backendUrl.addEventListener('change', checkFacebookAuth);
 

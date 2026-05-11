@@ -577,6 +577,27 @@ export async function updateCampaignStatus({
   });
 }
 
+
+export async function deleteCampaign({ campaignId }) {
+  const cleanCampaignId = normalizeNumericId(campaignId);
+  const token = getCurrentUserToken();
+
+  if (!token) {
+    throw new Error('Missing user token. Please connect Facebook again.');
+  }
+
+  if (!cleanCampaignId) {
+    throw new Error('Missing campaignId.');
+  }
+
+  return metaFetch(
+    `/${cleanCampaignId}?access_token=${encodeURIComponent(token)}`,
+    {
+      method: 'DELETE'
+    }
+  );
+}
+
 export async function updateAdSetStatus({
   adSetId,
   status = 'ACTIVE'
