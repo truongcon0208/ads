@@ -187,6 +187,57 @@ async function fetchJsonWithRetry(url, options = {}, { maxRetries = 4, baseDelay
   throw lastError || new Error(`${label} thất bại`);
 }
 
+
+function isBackendDisconnectError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  const type = String(err?.errorType || '').toUpperCase();
+
+  return (
+    type === 'NETWORK' ||
+    msg.includes('không kết nối được backend') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('fetch failed') ||
+    msg.includes('load failed') ||
+    msg.includes('networkerror') ||
+    msg.includes('abort') ||
+    msg.includes('timeout') ||
+    msg.includes('connection')
+  );
+}
+
+async function fetchJobStatusForever(url, options = {}, retryOptions = {}) {
+  let reconnectCount = 0;
+  let reconnectDelayMs = 30000;
+
+  while (true) {
+    try {
+      const data = await fetchJsonWithRetry(url, options, retryOptions);
+
+      if (reconnectCount > 0) {
+        appendStatus('Đã kết nối lại backend, tiếp tục lấy tiến độ job.', 'success');
+      }
+
+      return data;
+    } catch (err) {
+      if (!isBackendDisconnectError(err)) {
+        throw err;
+      }
+
+      reconnectCount += 1;
+
+      appendStatus(
+        `Mất kết nối backend tạm thời. Job có thể vẫn chạy trên Railway. Tự nối lại lần ${reconnectCount} sau ${Math.round(reconnectDelayMs / 1000)}s...`,
+        'running'
+      );
+
+      await sleep(reconnectDelayMs);
+
+      reconnectDelayMs = Math.min(Math.round(reconnectDelayMs * 1.5), 60000);
+    }
+  }
+}
+
+
 function renderFacebookIdentity(profile) {
   if (!els.fbIdentity) return;
 
@@ -608,7 +659,7 @@ async function deleteCampaignsByApi() {
     let lastProgressText = '';
 
     while (true) {
-      const statusData = await fetchJsonWithRetry(`${getBackendUrl()}/campaigns/delete-job-status/${encodeURIComponent(jobId)}?fromEventIndex=${fromEventIndex}`, {
+      const statusData = await fetchJobStatusForever(`${getBackendUrl()}/campaigns/delete-job-status/${encodeURIComponent(jobId)}?fromEventIndex=${fromEventIndex}`, {
         method: 'GET',
         timeoutMs: 20000
       }, {
@@ -733,7 +784,7 @@ async function runFullFlow() {
     let lastProgressText = '';
 
     while (true) {
-      const statusData = await fetchJsonWithRetry(`${getBackendUrl()}/flow/job-status/${encodeURIComponent(jobId)}?fromEventIndex=${fromEventIndex}`, {
+      const statusData = await fetchJobStatusForever(`${getBackendUrl()}/flow/job-status/${encodeURIComponent(jobId)}?fromEventIndex=${fromEventIndex}`, {
         method: 'GET',
         timeoutMs: 20000
       }, {
